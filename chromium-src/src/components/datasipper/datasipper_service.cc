@@ -19,6 +19,7 @@
 #include "components/datasipper/extraction/extraction_result.h"
 #include "components/datasipper/extraction/page_data_detector.h"
 #include "components/datasipper/streaming/stream_registry.h"
+#include "components/datasipper/streaming/stream_database_sync.h"
 #include "components/datasipper/streaming/network_stream_analyzer.h"
 #include "components/datasipper/streaming/stream_types.h"
 #include "components/datasipper/workflow/workflow_definition.h"
@@ -120,7 +121,8 @@ void DataSipperService::Shutdown() {
   workflow_engine_.reset();
   workflow_storage_.reset();
 
-  // Clear stream registry
+  // Clear stream database sync and registry
+  stream_db_sync_.reset();
   stream_registry_.reset();
 
   initialized_ = false;
@@ -175,6 +177,20 @@ bool DataSipperService::InitializeStorageComponents() {
   // Initialize stream registry
   stream_registry_ = std::make_unique<StreamRegistry>();
   LOG(INFO) << "✅ DataSipper: Stream registry initialized";
+
+  // Initialize database sync for stream persistence
+  if (database_) {
+    stream_db_sync_ = std::make_unique<StreamDatabaseSync>(
+        database_->db(), stream_registry_.get());
+
+    if (!stream_db_sync_->Initialize()) {
+      LOG(ERROR) << "Failed to initialize stream database sync";
+      stream_db_sync_.reset();
+      // Non-fatal, continue without persistence
+    } else {
+      LOG(INFO) << "✅ DataSipper: Stream database sync initialized";
+    }
+  }
 
   // Initialize network stream analyzer (global across all tabs)
   network_stream_analyzer_ = std::make_unique<NetworkStreamAnalyzer>();
@@ -354,9 +370,17 @@ void DataSipperService::OnStreamDetected(
   if (stream_registry_) {
     std::string stream_id = stream_registry_->RegisterStream(stream);
     LOG(INFO) << "📊 StreamRegistry: Stream registered as " << stream_id;
+
+    // Save to database for persistence
+    if (stream_db_sync_) {
+      if (stream_db_sync_->SaveStream(stream)) {
+        LOG(INFO) << "✅ Stream persisted to database: " << stream_id;
+      } else {
+        LOG(WARNING) << "Failed to save stream to database: " << stream_id;
+      }
+    }
   }
 
-  // TODO: Store stream definition in database
   // TODO: Check for workflows that should subscribe to this stream
   // TODO: Broadcast stream info to WebUI for user visibility
 }

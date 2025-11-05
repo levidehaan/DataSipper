@@ -19,6 +19,61 @@ struct WorkflowInfo {
   string url_pattern;
   bool enabled;
   int32 node_count;
+}
+
+// Stream type enum
+enum StreamType {
+  DOM_MUTATION = 0,
+  NETWORK_PATTERN = 1,
+  WEBSOCKET_STREAM = 2,
+};
+
+// Data type enum
+enum DataType {
+  UNKNOWN = 0,
+  JSON = 1,
+  XML = 2,
+  CSV = 3,
+  TEXT = 4,
+  BINARY = 5,
+};
+
+// Timing information for streams
+struct StreamTimingInfo {
+  double avg_interval_ms;
+  double std_deviation;
+  bool is_regular;
+};
+
+// Stream information for UI
+struct StreamInfo {
+  string stream_id;
+  string label;
+  StreamType type;
+  string source_pattern;
+  string url;
+
+  int64 first_seen;  // Unix timestamp ms
+  int64 last_seen;
+  StreamTimingInfo timing;
+
+  bool is_active;
+  int32 event_count;
+  DataType data_type;
+};
+
+// Individual stream event
+struct StreamEventInfo {
+  string stream_id;
+  int64 timestamp;  // Unix timestamp ms
+  string event_type;
+  string data;  // JSON string
+};
+
+// Stream subscription handle
+struct StreamSubscription {
+  string subscription_id;
+  string stream_id;
 };
 
 // Network request/response data for real-time monitoring
@@ -48,6 +103,12 @@ interface DataSipperObserver {
 
   // Called when a WebSocket message is received
   OnWebSocketMessage(string url, string message, bool is_outgoing);
+
+  // Stream notifications
+  OnStreamDetected(StreamInfo stream);
+  OnStreamUpdated(StreamInfo stream);
+  OnStreamEvent(StreamEventInfo event);
+  OnStreamDeactivated(string stream_id);
 };
 
 // Factory for creating the DataSipper page handler
@@ -72,6 +133,22 @@ interface DataSipperPageHandler {
 
   // Enable/disable a workflow
   ToggleWorkflow(string workflow_id, bool enabled) => (bool success);
+
+  // Stream management
+  GetDetectedStreams() => (array<StreamInfo> streams);
+  GetStreamDetails(string stream_id) => (StreamInfo? stream);
+  GetStreamEvents(string stream_id, int32 limit) => (array<StreamEventInfo> events);
+
+  // Stream subscriptions
+  SubscribeToStream(string stream_id) => (StreamSubscription? subscription);
+  UnsubscribeFromStream(string subscription_id) => (bool success);
+
+  // Stream control
+  SetStreamActive(string stream_id, bool active) => (bool success);
+  DeleteStream(string stream_id) => (bool success);
+
+  // Stream export
+  ExportStreamAsWorkflow(string stream_id) => (WorkflowInfo? workflow);
 
   // Notify the backend that the UI is ready to be shown.
   ShowUI();

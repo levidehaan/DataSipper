@@ -34,6 +34,7 @@ namespace datasipper {
 
 class DataSipperDatabase;
 class NetworkStreamAnalyzer;
+class StreamDatabaseSync;
 class StreamRegistry;
 class PageDataDetector;
 class WorkflowEngine;
@@ -79,6 +80,7 @@ class DATASIPPER_EXPORT DataSipperService : public KeyedService,
 
   // Stream registry access
   StreamRegistry* stream_registry() const { return stream_registry_.get(); }
+  StreamDatabaseSync* stream_db_sync() const { return stream_db_sync_.get(); }
 
   // Called by DataSipperNetworkBridge when network request is captured
   // (for extraction and workflow processing)
@@ -120,8 +122,9 @@ class DATASIPPER_EXPORT DataSipperService : public KeyedService,
   // Network stream analyzer (global, not per-tab)
   std::unique_ptr<NetworkStreamAnalyzer> network_stream_analyzer_;
 
-  // Stream registry
+  // Stream registry and database sync
   std::unique_ptr<StreamRegistry> stream_registry_;
+  std::unique_ptr<StreamDatabaseSync> stream_db_sync_;
 
   // Map of WebContents to their tracking data
   std::map<content::WebContents*, std::unique_ptr<TabTracker>> tab_trackers_;

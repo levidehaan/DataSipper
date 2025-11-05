@@ -38,6 +38,8 @@ component("datasipper") {
     "streaming/dom_stream_tracker.h",
     "streaming/network_stream_analyzer.cc",
     "streaming/network_stream_analyzer.h",
+    "streaming/stream_database_sync.cc",
+    "streaming/stream_database_sync.h",
     "streaming/stream_registry.cc",
     "streaming/stream_registry.h",
     "streaming/stream_types.cc",
