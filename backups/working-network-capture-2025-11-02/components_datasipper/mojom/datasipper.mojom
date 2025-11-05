@@ -1,0 +1,210 @@
+// Copyright 2024 The DataSipper Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+module datasipper.mojom;
+
+import "mojo/public/mojom/base/time.mojom";
+import "mojo/public/mojom/base/values.mojom";
+
+// Data source type detected on page
+enum DataSourceType {
+  HTML_TABLE,
+  JSON_OBJECT,
+  JSON_LD,
+  CSV_DATA,
+  FORM_DATA,
+  XML_DATA,
+  CUSTOM
+};
+
+// Extracted data source from page
+struct ExtractedDataSource {
+  string id;
+  DataSourceType type;
+  string selector_path;
+  string label;
+  string raw_content;
+  mojo_base.mojom.Value parsed_data;
+  map<string, string> metadata;
+  mojo_base.mojom.Time extracted_at;
+  float confidence_score;
+  bool is_tracked;
+};
+
+// Workflow node type
+enum NodeType {
+  DATA_SOURCE,
+  TRANSFORM,
+  AI_PROCESSOR,
+  EXPORT,
+  FILTER,
+  AGGREGATE,
+  SCRIPT,
+  WEBHOOK
+};
+
+// Workflow node
+struct WorkflowNode {
+  string id;
+  NodeType type;
+  string label;
+  mojo_base.mojom.Value config;
+  int32 position_x;
+  int32 position_y;
+};
+
+// Workflow edge
+struct WorkflowEdge {
+  string id;
+  string source_node_id;
+  string target_node_id;
+  string? source_handle;
+  string? target_handle;
+};
+
+// Workflow trigger type
+enum TriggerType {
+  MANUAL,
+  TIMER,
+  PAGE_LOAD,
+  PAGE_UNLOAD,
+  WEBSOCKET_EVENT,
+  DOM_MUTATION,
+  NETWORK_RESPONSE,
+  CUSTOM_EVENT
+};
+
+// Workflow status
+enum WorkflowStatus {
+  ACTIVE,
+  PAUSED,
+  STOPPED,
+  ERROR
+};
+
+// Complete workflow definition
+struct Workflow {
+  string id;
+  string name;
+  string description;
+  string url_pattern;
+  array<WorkflowNode> nodes;
+  array<WorkflowEdge> edges;
+  mojo_base.mojom.Value trigger_config;
+  bool auto_resume_on_tab_open;
+  bool enabled;
+  mojo_base.mojom.Time created_at;
+  mojo_base.mojom.Time updated_at;
+  WorkflowStatus status;
+  string? output_schema_name;
+};
+
+// Workflow execution status
+enum ExecutionStatus {
+  PENDING,
+  RUNNING,
+  COMPLETED,
+  FAILED,
+  CANCELLED
+};
+
+// Workflow execution context
+struct WorkflowExecutionContext {
+  string execution_id;
+  string workflow_id;
+  int32 tab_id;
+  mojo_base.mojom.Time started_at;
+  mojo_base.mojom.Time? completed_at;
+  ExecutionStatus status;
+  map<string, mojo_base.mojom.Value> node_results;
+  string? error_message;
+  string? failed_node_id;
+};
+
+// Kafka configuration
+struct KafkaConfig {
+  string brokers;
+  string topic;
+  string? client_id;
+  string? security_protocol;
+  string? sasl_username;
+  string? sasl_password;
+  int32 batch_size;
+  bool enable_offline_queue;
+};
+
+// Export configuration
+struct ExportConfig {
+  string id;
+  string type;  // "kafka", "redis", "postgres", "sqlite"
+  string name;
+  mojo_base.mojom.Value config;
+  bool is_active;
+};
+
+// Schema definition for custom tables
+struct SchemaDefinition {
+  string name;
+  string table_name;
+  mojo_base.mojom.Value fields;  // Array of field definitions
+  array<string> indexes;
+  mojo_base.mojom.Time created_at;
+};
+
+// Page handler interface (C++ -> UI)
+interface DataSipperPageHandler {
+  // Data extraction
+  GetDetectedData() => (array<ExtractedDataSource> sources);
+  RefreshDataDetection() => (array<ExtractedDataSource> sources);
+  EnableLiveTracking(bool enable);
+
+  // Workflow management
+  CreateWorkflow(Workflow workflow) => (bool success, string? error);
+  UpdateWorkflow(string id, Workflow workflow) => (bool success, string? error);
+  DeleteWorkflow(string id) => (bool success);
+  GetWorkflow(string id) => (Workflow? workflow);
+  GetAllWorkflows() => (array<Workflow> workflows);
+  GetWorkflowsForCurrentUrl() => (array<Workflow> workflows);
+
+  // Workflow execution
+  ExecuteWorkflow(string id) => (string execution_id);
+  CancelExecution(string execution_id) => (bool success);
+  GetExecutionStatus(string execution_id) => (WorkflowExecutionContext context);
+  GetExecutionHistory(string workflow_id, int32 limit) =>
+      (array<WorkflowExecutionContext> executions);
+
+  // Schema management
+  CreateSchema(SchemaDefinition schema) => (bool success, string? error);
+  UpdateSchema(string name, SchemaDefinition schema) => (bool success, string? error);
+  DeleteSchema(string name) => (bool success);
+  GetAllSchemas() => (array<SchemaDefinition> schemas);
+
+  // Export configuration
+  SaveExportConfig(ExportConfig config) => (bool success, string? error);
+  DeleteExportConfig(string id) => (bool success);
+  GetAllExportConfigs() => (array<ExportConfig> configs);
+  TestKafkaConnection(KafkaConfig config) => (bool success, string? error);
+
+  // Credentials (encrypted storage)
+  SaveApiKey(string service, string key) => (bool success);
+  GetApiKey(string service) => (string? key);
+  DeleteApiKey(string service) => (bool success);
+
+  // Import/Export
+  ExportWorkflow(string id) => (mojo_base.mojom.Value? workflow_json);
+  ImportWorkflow(mojo_base.mojom.Value workflow_json) => (bool success, string? error);
+};
+
+// Page interface (UI -> C++)
+interface DataSipperPage {
+  // Notify UI of data changes
+  OnDataSourcesUpdated(array<ExtractedDataSource> sources);
+
+  // Notify UI of workflow execution updates
+  OnWorkflowExecutionUpdate(string execution_id, ExecutionStatus status,
+                           mojo_base.mojom.Value? result);
+
+  // Notify UI of workflow status changes
+  OnWorkflowStatusChanged(string workflow_id, WorkflowStatus status);
+};

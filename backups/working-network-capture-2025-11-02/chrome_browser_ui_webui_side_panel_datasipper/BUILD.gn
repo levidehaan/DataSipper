@@ -1,0 +1,31 @@
+import("//mojo/public/tools/bindings/mojom.gni")
+import("//chrome/common/features.gni")
+
+assert(enable_datasipper)
+
+mojom("mojo_bindings") {
+  sources = [ "datasipper.mojom" ]
+  webui_module_path = "/"
+}
+
+static_library("datasipper") {
+  sources = [
+    "datasipper_page_handler.cc",
+    "datasipper_page_handler.h",
+    "datasipper_ui.cc",
+    "datasipper_ui.h",
+  ]
+
+  deps = [
+    ":mojo_bindings",
+    "//chrome/browser:browser_process",
+    "//chrome/browser/datasipper",
+    "//chrome/browser/profiles:profile",
+    "//chrome/common",
+    "//chrome/common:constants",
+    "//components/datasipper",
+    "//content/public/browser",
+    "//mojo/public/cpp/bindings",
+    "//ui/webui",
+  ]
+}

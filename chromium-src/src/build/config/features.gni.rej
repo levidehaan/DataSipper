@@ -1,0 +1,18 @@
+--- build/config/features.gni
++++ build/config/features.gni
+@@ -160,6 +160,15 @@ declare_args() {
+   # Enables sharing audio devices between content and chrome processes.
+   enable_audio_service_sharing = true
+ 
++  # DataSipper feature toggles
++  enable_datasipper = true
++  datasipper_network_monitoring = true
++  datasipper_websocket_monitoring = true
++  datasipper_stream_processing = true
++  datasipper_external_outputs = false
++  datasipper_javascript_api = false
++  datasipper_advanced_ui = false
++
+   # Enables sharing the media session service between content and chrome
+   # processes.
+   enable_media_session_service = true

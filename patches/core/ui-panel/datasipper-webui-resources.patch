@@ -1,0 +1,285 @@
+# DataSipper: WebUI resources and frontend implementation
+#
+# This patch adds the HTML, CSS, and JavaScript resources for the
+# DataSipper monitoring panel interface.
+#
+# Affects:
+# - chrome/browser/resources/datasipper/ (new directory)
+# - chrome/browser/resources/datasipper/datasipper.html (new file)
+# - chrome/browser/resources/datasipper/datasipper.css (new file)
+# - chrome/browser/resources/datasipper/datasipper.js (new file)
+
+--- /dev/null
++++ b/chrome/browser/resources/datasipper/datasipper.html
+@@ -0,0 +1,178 @@
++<!DOCTYPE html>
++<html>
++<head>
++  <meta charset="utf-8">
++  <title>DataSipper Network Monitor</title>
++  <link rel="stylesheet" href="datasipper.css">
++</head>
++<body>
++  <div id="datasipper-app" class="datasipper-container">
++    <!-- Header -->
++    <header class="datasipper-header">
++      <div class="header-content">
++        <h1 class="header-title">
++          <span class="header-icon">📡</span>
++          DataSipper
++        </h1>
++        <div class="header-controls">
++          <button id="refresh-btn" class="btn btn-primary" title="Refresh Data">
++            ↻
++          </button>
++          <button id="clear-btn" class="btn btn-secondary" title="Clear Events">
++            🗑️
++          </button>
++          <button id="settings-btn" class="btn btn-secondary" title="Settings">
++            ⚙️
++          </button>
++        </div>
++      </div>
++      
++      <!-- Status Bar -->
++      <div class="status-bar">
++        <div class="status-item">
++          <span class="status-label">Events:</span>
++          <span id="event-count" class="status-value">0</span>
++        </div>
++        <div class="status-item">
++          <span class="status-label">Active Streams:</span>
++          <span id="stream-count" class="status-value">0</span>
++        </div>
++        <div class="status-item">
++          <span class="status-label">Outputs:</span>
++          <span id="output-status" class="status-value">Connected</span>
++        </div>
++      </div>
++    </header>
++
++    <!-- Main Content -->
++    <main class="datasipper-main">
++      <!-- Tab Navigation -->
++      <nav class="tab-nav">
++        <button class="tab-btn active" data-tab="events">
++          📊 Live Events
++        </button>
++        <button class="tab-btn" data-tab="streams">
++          🔀 Stream Rules
++        </button>
++        <button class="tab-btn" data-tab="outputs">
++          📤 Output Config
++        </button>
++        <button class="tab-btn" data-tab="transform">
++          🔧 Transform
++        </button>
++      </nav>
++
++      <!-- Tab Content -->
++      <div class="tab-content">
++        <!-- Live Events Tab -->
++        <div id="events-tab" class="tab-panel active">
++          <div class="panel-header">
++            <h2>Live Network Events</h2>
++            <div class="event-controls">
++              <label class="checkbox-label">
++                <input type="checkbox" id="auto-scroll" checked>
++                Auto-scroll
++              </label>
++              <label class="checkbox-label">
++                <input type="checkbox" id="pause-capture">
++                Pause capture
++              </label>
++              <select id="event-filter" class="filter-select">
++                <option value="all">All Events</option>
++                <option value="http">HTTP Only</option>
++                <option value="websocket">WebSocket Only</option>
++                <option value="errors">Errors Only</option>
++              </select>
++            </div>
++          </div>
++          
++          <div class="events-container">
++            <div id="events-list" class="events-list">
++              <!-- Events will be populated here -->
++            </div>
++          </div>
++        </div>
+
++        <!-- Stream Rules Tab -->
++        <div id="streams-tab" class="tab-panel">
++          <div class="panel-header">
++            <h2>Stream Configuration</h2>
++            <button id="add-rule-btn" class="btn btn-primary">
++              + Add Rule
++            </button>
++          </div>
++          
++          <div class="streams-container">
++            <div id="rules-list" class="rules-list">
++              <!-- Stream rules will be populated here -->
++            </div>
++          </div>
++        </div>
+
++        <!-- Output Configuration Tab -->
++        <div id="outputs-tab" class="tab-panel">
++          <div class="panel-header">
++            <h2>Output Connectors</h2>
++            <button id="add-output-btn" class="btn btn-primary">
++              + Add Output
++            </button>
++          </div>
++          
++          <div class="outputs-container">
++            <div class="output-grid">
++              <!-- Kafka Configuration -->
++              <div class="output-card" data-type="kafka">
++                <div class="output-header">
++                  <h3>🚀 Kafka</h3>
++                  <div class="output-status" id="kafka-status">Disconnected</div>
++                </div>
++                <div class="output-config" id="kafka-config">
++                  <!-- Kafka config form will be here -->
++                </div>
++              </div>
++              
++              <!-- Redis Configuration -->
++              <div class="output-card" data-type="redis">
++                <div class="output-header">
++                  <h3>⚡ Redis</h3>
++                  <div class="output-status" id="redis-status">Disconnected</div>
++                </div>
++                <div class="output-config" id="redis-config">
++                  <!-- Redis config form will be here -->
++                </div>
++              </div>
++            </div>
++          </div>
++        </div>
+
++        <!-- Transform Tab -->
++        <div id="transform-tab" class="tab-panel">
++          <div class="panel-header">
++            <h2>Data Transformation</h2>
++            <div class="transform-controls">
++              <button id="test-transform-btn" class="btn btn-primary">
++                🧪 Test Transform
++              </button>
++              <button id="save-transform-btn" class="btn btn-success">
++                💾 Save
++              </button>
++            </div>
++          </div>
++          
++          <div class="transform-container">
++            <div class="transform-editor">
++              <h3>JavaScript Transformation</h3>
++              <textarea id="transform-code" class="code-editor" 
++                        placeholder="// Transform function - access event data via 'event' object
++// Return transformed data object
++
++function transform(event) {
++  // Example: Extract user ID from URL
++  const userId = event.url.match(/\/users\/(\d+)/)?.[1];
++  
++  return {
++    user_id: userId,
++    method: event.method,
++    timestamp: Date.now(),
++    custom_field: 'processed_by_datasipper'
++  };
++}"></textarea>
++            </div>
++            
++            <div class="transform-test">
++              <h3>Test Results</h3>
++              <div id="transform-output" class="transform-output">
++                <pre>// Test output will appear here</pre>
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </main>
++  </div>
+
++  <!-- Modals -->
++  <!-- Rule Configuration Modal -->
++  <div id="rule-modal" class="modal">
++    <div class="modal-content">
++      <div class="modal-header">
++        <h2 id="rule-modal-title">Create Stream Rule</h2>
++        <button class="modal-close">&times;</button>
++      </div>
++      <div class="modal-body">
++        <form id="rule-form">
++          <div class="form-group">
++            <label for="rule-name">Rule Name</label>
++            <input type="text" id="rule-name" class="form-input" required>
++          </div>
++          
++          <div class="form-group">
++            <label for="rule-description">Description</label>
++            <textarea id="rule-description" class="form-input"></textarea>
++          </div>
++          
++          <div class="form-group">
++            <label>Routing Conditions</label>
++            <div id="conditions-container" class="conditions-container">
++              <!-- Dynamic conditions will be added here -->
++            </div>
++            <button type="button" id="add-condition-btn" class="btn btn-secondary">
++              + Add Condition
++            </button>
++          </div>
++          
++          <div class="form-group">
++            <label for="rule-logic">Logic Mode</label>
++            <select id="rule-logic" class="form-input">
++              <option value="AND">AND (All conditions must match)</option>
++              <option value="OR">OR (Any condition can match)</option>
++            </select>
++          </div>
++          
++          <div class="form-group">
++            <label for="rule-group">Target Group</label>
++            <input type="text" id="rule-group" class="form-input">
++          </div>
++          
++          <div class="form-group">
++            <label for="rule-output">Output Target</label>
++            <select id="rule-output" class="form-input">
++              <option value="">Default</option>
++              <option value="kafka">Kafka</option>
++              <option value="redis">Redis</option>
++            </select>
++          </div>
++        </form>
++      </div>
++      <div class="modal-footer">
++        <button type="button" class="btn btn-secondary" data-action="cancel">Cancel</button>
++        <button type="button" class="btn btn-primary" data-action="save">Save Rule</button>
++      </div>
++    </div>
++  </div>
+
++  <!-- Connection Test Modal -->
++  <div id="test-modal" class="modal">
++    <div class="modal-content">
++      <div class="modal-header">
++        <h2>Connection Test</h2>
++        <button class="modal-close">&times;</button>
++      </div>
++      <div class="modal-body">
++        <div id="test-results" class="test-results">
++          <div class="loading">Testing connection...</div>
++        </div>
++      </div>
++    </div>
++  </div>
+
++  <script src="datasipper.js"></script>
++</body>
++</html>

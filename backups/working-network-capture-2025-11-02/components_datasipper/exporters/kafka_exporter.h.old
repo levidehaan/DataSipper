@@ -1,0 +1,156 @@
+// Copyright 2024 The DataSipper Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef COMPONENTS_DATASIPPER_EXPORTERS_KAFKA_EXPORTER_H_
+#define COMPONENTS_DATASIPPER_EXPORTERS_KAFKA_EXPORTER_H_
+
+#include <memory>
+#include <string>
+#include <queue>
+
+#include "base/functional/callback.h"
+#include "base/memory/weak_ptr.h"
+#include "base/sequence_checker.h"
+#include "base/values.h"
+
+// Forward declare librdkafka types to avoid including in header
+struct rd_kafka_s;
+struct rd_kafka_topic_s;
+struct rd_kafka_conf_s;
+
+namespace datasipper {
+
+// Configuration for Kafka connection
+struct KafkaConfig {
+  KafkaConfig();
+  KafkaConfig(const KafkaConfig&);
+  KafkaConfig& operator=(const KafkaConfig&);
+  ~KafkaConfig();
+
+  // Connection settings
+  std::string brokers;  // Comma-separated list: "localhost:9092,broker2:9092"
+  std::string topic;
+  std::string client_id = "datasipper";
+
+  // Authentication (optional)
+  std::string security_protocol;  // "PLAINTEXT", "SASL_SSL", etc.
+  std::string sasl_mechanism;     // "PLAIN", "SCRAM-SHA-256", etc.
+  std::string sasl_username;
+  std::string sasl_password;
+
+  // Performance tuning
+  int batch_size = 100;           // Messages to batch before sending
+  int linger_ms = 100;            // Max time to wait for batch
+  int compression_type = 0;       // 0=none, 1=gzip, 2=snappy, 3=lz4
+  int max_in_flight = 1000000;    // Max messages in flight
+
+  // Reliability
+  int acks = 1;                   // 0=no ack, 1=leader, -1=all replicas
+  int request_timeout_ms = 30000;
+  int message_timeout_ms = 300000;
+
+  // Offline queue (for tab refresh scenarios)
+  bool enable_offline_queue = true;
+  size_t max_offline_queue_size = 10000;
+
+  // Serialization
+  enum class SerializationFormat {
+    JSON,
+    JSON_COMPACT,
+    AVRO,
+    PROTOBUF
+  };
+  SerializationFormat format = SerializationFormat::JSON;
+
+  base::Value ToJson() const;
+  static KafkaConfig FromJson(const base::Value& json);
+};
+
+// Kafka producer for exporting data
+class KafkaExporter {
+ public:
+  using DeliveryCallback = base::OnceCallback<void(bool success,
+                                                   const std::string& error)>;
+
+  KafkaExporter();
+  ~KafkaExporter();
+
+  KafkaExporter(const KafkaExporter&) = delete;
+  KafkaExporter& operator=(const KafkaExporter&) = delete;
+
+  // Initialize connection
+  bool Initialize(const KafkaConfig& config);
+
+  // Send message to Kafka
+  void SendMessage(const std::string& key,
+                   const base::Value& data,
+                   DeliveryCallback callback);
+
+  // Send batch of messages
+  void SendBatch(const std::vector<std::pair<std::string, base::Value>>& messages,
+                 DeliveryCallback callback);
+
+  // Connection management
+  bool IsConnected() const;
+  void Disconnect();
+  bool Reconnect();
+
+  // Test connection
+  static void TestConnection(const KafkaConfig& config,
+                            base::OnceCallback<void(bool, std::string)> callback);
+
+  // Flush all pending messages
+  void Flush(int timeout_ms = 10000);
+
+  // Get statistics
+  struct Stats {
+    int64_t messages_sent = 0;
+    int64_t messages_failed = 0;
+    int64_t bytes_sent = 0;
+    int64_t messages_queued = 0;  // In offline queue
+  };
+  Stats GetStats() const;
+
+ private:
+  // Serialize data to bytes
+  std::string SerializeMessage(const base::Value& data);
+
+  // Handle delivery report callback (called by librdkafka)
+  static void DeliveryReportCallback(rd_kafka_s* rk,
+                                     const void* msg,
+                                     size_t len,
+                                     int error_code,
+                                     void* opaque,
+                                     void* msg_opaque);
+
+  // Poll for events
+  void PollEvents();
+
+  // Offline queue management
+  void EnqueueOfflineMessage(const std::string& key, const base::Value& data);
+  void ProcessOfflineQueue();
+
+  struct PendingMessage {
+    std::string key;
+    base::Value data;
+    DeliveryCallback callback;
+  };
+
+  KafkaConfig config_;
+  rd_kafka_s* producer_ = nullptr;
+  rd_kafka_topic_s* topic_ = nullptr;
+
+  // Offline message queue (survives disconnection/tab refresh)
+  std::queue<PendingMessage> offline_queue_;
+
+  Stats stats_;
+  bool is_initialized_ = false;
+
+  SEQUENCE_CHECKER(sequence_checker_);
+  base::WeakPtrFactory<KafkaExporter> weak_factory_{this};
+};
+
+}  // namespace datasipper
+
+#endif  // COMPONENTS_DATASIPPER_EXPORTERS_KAFKA_EXPORTER_H_

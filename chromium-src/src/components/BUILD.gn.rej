@@ -1,0 +1,14 @@
+--- components/BUILD.gn
++++ components/BUILD.gn
+@@ -54,6 +54,11 @@ group("components") {
+     "//components/cross_device",
+   ]
+ 
++  # DataSipper components
++  if (enable_datasipper) {
++    deps += [ "//components/datasipper" ]
++  }
++
+   if (!is_ios) {
+     deps += [
+       "//components/app_restore",

@@ -1,0 +1,176 @@
+# DataSipper: Slide-out panel implementation with WebUI
+#
+# This patch implements the DataSipper monitoring panel with HTML/CSS/JavaScript
+# for visualizing network data and configuring streams and routing.
+#
+# Affects:
+# - chrome/browser/ui/views/datasipper/datasipper_panel.h (new file)
+# - chrome/browser/ui/views/datasipper/datasipper_panel.cc (new file)
+# - chrome/browser/ui/webui/datasipper/ (new directory)
+
+--- /dev/null
++++ b/chrome/browser/ui/views/datasipper/datasipper_panel.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_PANEL_H_
++#define CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_PANEL_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/views/side_panel/side_panel_entry.h"
++#include "components/datasipper/stream/stream_selector.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/controls/webview/webview.h"
++#include "ui/views/view.h"
++
++class Browser;
++
++namespace content {
++class WebContents;
++}
++
++namespace datasipper {
++
++class DataSipperBrowserService;
++
++// Main DataSipper monitoring panel that slides out from the side
++class DataSipperPanel : public views::View,
++                       public SidePanelEntry,
++                       public datasipper::StreamSelectorObserver {
++ public:
++  METADATA_HEADER(DataSipperPanel);
++  
++  explicit DataSipperPanel(Browser* browser);
++  ~DataSipperPanel() override;
++
++  DataSipperPanel(const DataSipperPanel&) = delete;
++  DataSipperPanel& operator=(const DataSipperPanel&) = delete;
++
++  // views::View:
++  void Layout() override;
++  gfx::Size CalculatePreferredSize() const override;
++  void OnThemeChanged() override;
++  void VisibilityChanged(views::View* starting_from, bool is_visible) override;
++
++  // SidePanelEntry:
++  std::u16string name() const override;
++  const gfx::VectorIcon& icon() const override;
++  
++  // Panel management
++  void Toggle();
++  void Show();
++  void Hide();
++  bool IsVisible() const;
++  
++  // Content updates
++  void OnWebContentsChanged(content::WebContents* web_contents);
++  void RefreshData();
++  
++  // StreamSelectorObserver implementation
++  void OnRuleAdded(const std::string& rule_name) override;
++  void OnRuleRemoved(const std::string& rule_name) override;
++  void OnRuleUpdated(const std::string& rule_name) override;
++  void OnGroupCreated(const std::string& group_name) override;
++  void OnEventRouted(const std::string& group_name, const NetworkEvent& event) override;
++
++ private:
++  void InitializeWebUI();
++  void SetupWebContents();
++  void SendDataToWebUI(const std::string& message_type, const base::Value::Dict& data);
++  void HandleWebUIMessage(const std::string& message, const base::Value::List& args);
++  
++  // Panel state management
++  void UpdatePanelVisibility();
++  void SavePanelState();
++  void RestorePanelState();
++  
++  raw_ptr<Browser> browser_;
++  raw_ptr<DataSipperBrowserService> datasipper_service_;
++  
++  std::unique_ptr<views::WebView> web_view_;
++  std::unique_ptr<content::WebContents> web_contents_;
++  
++  bool is_visible_ = false;
++  gfx::Size preferred_size_{400, 600};  // Default panel size
++  
++  base::WeakPtrFactory<DataSipperPanel> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_PANEL_H_
+--- /dev/null
++++ b/chrome/browser/ui/webui/datasipper/datasipper_ui.h
+@@ -0,0 +1,65 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_DATASIPPER_DATASIPPER_UI_H_
++#define CHROME_BROWSER_UI_WEBUI_DATASIPPER_DATASIPPER_UI_H_
++
++#include "content/public/browser/web_ui_controller.h"
++#include "ui/webui/mojo_web_ui_controller.h"
++
++namespace content {
++class WebUI;
++}
++
++namespace datasipper {
++
++// WebUI controller for the DataSipper monitoring interface
++class DataSipperUI : public ui::MojoWebUIController {
++ public:
++  explicit DataSipperUI(content::WebUI* web_ui);
++  ~DataSipperUI() override;
++
++  DataSipperUI(const DataSipperUI&) = delete;
++  DataSipperUI& operator=(const DataSipperUI&) = delete;
++
++  // Instantiates the implementor of the mojom::PageHandlerFactory mojo
++  // interface passing the pending receiver that will be internally bound.
++  void BindInterface(
++      mojo::PendingReceiver<datasipper::mojom::PageHandlerFactory> receiver);
++
++ private:
++  std::unique_ptr<DataSipperPageHandler> page_handler_;
++  
++  WEB_UI_CONTROLLER_TYPE_DECL();
++};
++
++// Page handler for DataSipper WebUI
++class DataSipperPageHandler : public datasipper::mojom::PageHandler {
++ public:
++  DataSipperPageHandler(
++      mojo::PendingReceiver<datasipper::mojom::PageHandler> receiver,
++      content::WebUI* web_ui);
++  ~DataSipperPageHandler() override;
++
++  DataSipperPageHandler(const DataSipperPageHandler&) = delete;
++  DataSipperPageHandler& operator=(const DataSipperPageHandler&) = delete;
++
++  // datasipper::mojom::PageHandler:
++  void GetNetworkEvents(GetNetworkEventsCallback callback) override;
++  void GetStreamRules(GetStreamRulesCallback callback) override;
++  void CreateStreamRule(datasipper::mojom::StreamRulePtr rule, CreateStreamRuleCallback callback) override;
++  void UpdateStreamRule(const std::string& rule_name, datasipper::mojom::StreamRulePtr rule, UpdateStreamRuleCallback callback) override;
++  void DeleteStreamRule(const std::string& rule_name, DeleteStreamRuleCallback callback) override;
++  void GetOutputConnectors(GetOutputConnectorsCallback callback) override;
++  void ConfigureOutputConnector(const std::string& connector_name, base::Value::Dict config, ConfigureOutputConnectorCallback callback) override;
++  void TestConnection(const std::string& connector_name, TestConnectionCallback callback) override;
++
++ private:
++  mojo::Receiver<datasipper::mojom::PageHandler> receiver_;
++  raw_ptr<content::WebUI> web_ui_;
++  raw_ptr<DataSipperBrowserService> datasipper_service_;
++};
++
++}  // namespace datasipper
++
++#endif  // CHROME_BROWSER_UI_WEBUI_DATASIPPER_DATASIPPER_UI_H_

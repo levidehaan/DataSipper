@@ -1,0 +1,131 @@
+# DataSipper: Build system integration (Corrected for Current Chromium)
+#
+# This patch adds proper build system integration for DataSipper features
+# following current Chromium build patterns with feature-specific buildflags.
+#
+# Files affected:
+# - chrome/browser/datasipper/buildflags.gni (new)
+# - chrome/browser/BUILD.gn
+# - chrome/browser/datasipper/BUILD.gn (new)
+
+--- /dev/null
++++ b/chrome/browser/datasipper/buildflags.gni
+@@ -0,0 +1,25 @@
++# Copyright 2024 The DataSipper Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/buildflag_header.gni")
++
++# DataSipper feature flags
++declare_args() {
++  # Enable DataSipper network monitoring and data export functionality
++  enable_datasipper = true
++
++  # Enable network request/response interception
++  enable_datasipper_network_interception = true
++
++  # Enable WebSocket message monitoring
++  enable_datasipper_websocket_monitoring = true
++
++  # Enable DataSipper UI panel
++  enable_datasipper_ui_panel = true
++
++  # Enable external data export (Kafka, Redis, etc.)
++  enable_datasipper_external_outputs = false
++
++  # Enable development/debugging features
++  enable_datasipper_dev_features = false
++}
++
++buildflag_header("buildflags") {
++  header = "datasipper_buildflags.h"
++  flags = [
++    "ENABLE_DATASIPPER=$enable_datasipper",
++    "ENABLE_DATASIPPER_NETWORK_INTERCEPTION=$enable_datasipper_network_interception",
++    "ENABLE_DATASIPPER_WEBSOCKET_MONITORING=$enable_datasipper_websocket_monitoring",
++    "ENABLE_DATASIPPER_UI_PANEL=$enable_datasipper_ui_panel",
++    "ENABLE_DATASIPPER_EXTERNAL_OUTPUTS=$enable_datasipper_external_outputs",
++    "ENABLE_DATASIPPER_DEV_FEATURES=$enable_datasipper_dev_features",
++  ]
++}
+
+--- /dev/null
++++ b/chrome/browser/datasipper/BUILD.gn
+@@ -0,0 +1,50 @@
++# Copyright 2024 The DataSipper Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/features.gni")
++import("//chrome/browser/datasipper/buildflags.gni")
++
++if (enable_datasipper) {
++  source_set("datasipper_core") {
++    sources = [
++      "datasipper_service.cc",
++      "datasipper_service.h",
++      "datasipper_service_factory.cc",
++      "datasipper_service_factory.h",
++    ]
++
++    deps = [
++      ":buildflags",
++      "//base",
++      "//chrome/browser/profiles:profile",
++      "//content/public/browser",
++      "//components/keyed_service/content",
++    ]
++
++    if (enable_datasipper_network_interception) {
++      sources += [
++        "network_interceptor.cc",
++        "network_interceptor.h",
++      ]
++      deps += [
++        "//services/network/public/cpp",
++        "//services/network/public/mojom",
++      ]
++    }
++
++    if (enable_datasipper_ui_panel) {
++      sources += [
++        "datasipper_web_ui.cc",
++        "datasipper_web_ui.h",
++      ]
++      deps += [
++        "//content/public/browser",
++        "//ui/base",
++        "//ui/webui",
++      ]
++    }
++  }
++} else {
++  # Placeholder target when DataSipper is disabled
++  source_set("datasipper_core") {
++  }
++}
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -14,6 +14,7 @@ import("//chrome/browser/buildflags.gni")
+ import("//chrome/browser/downgrade/buildflags.gni")
+ import("//chrome/browser/request_header_integrity/buildflags.gni")
+ import("//chrome/common/features.gni")
++import("//chrome/browser/datasipper/buildflags.gni")
+ import("//chrome/services/speech/buildflags/buildflags.gni")
+ import("//chromeos/ash/components/assistant/assistant.gni")
+ import("//components/captive_portal/core/features.gni")
+@@ -2735,6 +2736,12 @@ static_library("browser") {
+     "//ui/webui",
+   ]
+ 
++  # DataSipper integration
++  if (enable_datasipper) {
++    deps += [ "//chrome/browser/datasipper:datasipper_core" ]
++    sources += [ "datasipper/datasipper_browser_integration.cc" ]
++  }
++
+   # On Windows, the hashes are embedded in the binary manifest.
+   if (is_win) {
+     deps += [ ":chrome_exe_main_exports" ]

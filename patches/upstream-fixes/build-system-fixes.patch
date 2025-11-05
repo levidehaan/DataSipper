@@ -1,0 +1,141 @@
+# DataSipper: Build system compatibility fixes
+#
+# This patch adds necessary build system integration for DataSipper features
+# including GN args, feature flags, and component dependencies.
+#
+# Affects:
+# - BUILD.gn (root)
+# - chrome/browser/BUILD.gn
+# - build/config/features.gni
+
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -235,6 +235,13 @@ declare_args() {
+   # Enable usage of Android AAudio library for audio playback.
+   use_aaudio = false
+ 
++  # DataSipper build configuration
++  datasipper_enabled = true
++  datasipper_network_interception = true
++  datasipper_ui_panel = true
++  datasipper_external_integrations = false
++  datasipper_dev_features = false
++
+   # Enable the Metal rendering backend.
+   use_metal = is_mac
+ 
+@@ -298,6 +305,16 @@ config("compiler_defaults") {
+     defines += [ "ENABLE_PRINTING=1" ]
+   }
+ 
++  # DataSipper feature defines
++  if (datasipper_enabled) {
++    defines += [ "BUILDFLAG_ENABLE_DATASIPPER=true" ]
++    if (datasipper_network_interception) {
++      defines += [ "DATASIPPER_NETWORK_INTERCEPTION_ENABLED=1" ]
++    }
++    if (datasipper_ui_panel) {
++      defines += [ "DATASIPPER_UI_PANEL_ENABLED=1" ]
++    }
++  }
+   if (use_goma) {
+     defines += [ "USE_GOMA" ]
+   }
+--- a/build/config/features.gni
++++ b/build/config/features.gni
+@@ -160,6 +160,15 @@ declare_args() {
+   # Enables sharing audio devices between content and chrome processes.
+   enable_audio_service_sharing = true
+ 
++  # DataSipper feature toggles
++  enable_datasipper = true
++  datasipper_network_monitoring = true
++  datasipper_websocket_monitoring = true
++  datasipper_stream_processing = true
++  datasipper_external_outputs = false
++  datasipper_javascript_api = false
++  datasipper_advanced_ui = false
++
+   # Enables sharing the media session service between content and chrome
+   # processes.
+   enable_media_session_service = true
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -2730,6 +2730,12 @@ static_library("browser") {
+     "//ui/webui",
+   ]
+ 
++  # DataSipper integration
++  if (enable_datasipper) {
++    deps += [ "//chrome/browser/datasipper" ]
++    sources += [ "datasipper/datasipper_browser_integration.cc" ]
++  }
++
+   # On Windows, the hashes are embedded in the binary manifest.
+   if (is_win) {
+     deps += [ ":chrome_exe_main_exports" ]
+--- a/components/BUILD.gn
++++ b/components/BUILD.gn
+@@ -54,6 +54,11 @@ group("components") {
+     "//components/cross_device",
+   ]
+ 
++  # DataSipper components
++  if (enable_datasipper) {
++    deps += [ "//components/datasipper" ]
++  }
++
+   if (!is_ios) {
+     deps += [
+       "//components/app_restore",
+--- /dev/null
++++ b/chrome/browser/datasipper/datasipper_browser_integration.cc
+@@ -0,0 +1,32 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "base/feature_list.h"
++#include "chrome/browser/datasipper/datasipper_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_features.h"
++#include "content/public/browser/browser_context.h"
++
++namespace datasipper {
++
++// Initialize DataSipper for a new browser context
++void InitializeDataSipperForBrowserContext(content::BrowserContext* context) {
++  if (!base::FeatureList::IsEnabled(features::kDataSipperEnabled)) {
++    return;
++  }
++  
++  Profile* profile = Profile::FromBrowserContext(context);
++  if (!profile || profile->IsOffTheRecord()) {
++    return;
++  }
++
++  // Initialize DataSipper service for this profile
++  auto* service = DataSipperServiceFactory::GetForProfile(profile);
++  if (service) {
++    // Service is automatically initialized by factory
++  }
++}
++
++}  // namespace datasipper
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -234,6 +234,14 @@ component("network_service") {
+     "//url",
+   ]
+ 
++  # DataSipper network integration
++  if (enable_datasipper && datasipper_network_monitoring) {
++    sources += [
++      "datasipper_network_observer.cc",
++      "datasipper_network_observer.h",
++    ]
++  }
++
+   public_deps = [
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",

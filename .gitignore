@@ -1,0 +1,28 @@
+# DataSipper Build Files
+# build/
+# chromium-src/
+# build-logs/
+# tmp/
+
+# Build outputs
+# chrome
+# chrome-*
+# datasipper
+# out/
+
+# Development files
+*.log
+*.cache
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# YoYo AI version control directory
+.yoyo/
+.venv
+.cipd
+.claude
+.cursor

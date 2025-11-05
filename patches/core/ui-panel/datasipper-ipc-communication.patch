@@ -1,0 +1,321 @@
+# DataSipper: IPC Communication System
+#
+# This patch implements the Inter-Process Communication system between
+# the network service, browser process, and UI panel for real-time data flow.
+
+--- /dev/null
++++ b/chrome/browser/datasipper/datasipper_browser_service.h
+@@ -0,0 +1,196 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_DATASIPPER_DATASIPPER_BROWSER_SERVICE_H_
++#define CHROME_BROWSER_DATASIPPER_DATASIPPER_BROWSER_SERVICE_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++#include "components/datasipper/common/network_event.h"
++#include "components/datasipper/storage/data_storage_service.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "content/public/browser/browser_context.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++#include "mojo/public/cpp/bindings/remote_set.h"
++
++namespace content {
++class BrowserContext;
++class WebContents;
++}
++
++namespace datasipper {
++
++class DataSipperPanel;
++class StreamRule;
++class OutputConnector;
++
++namespace mojom {
++class DataSipperObserver;
++class PageHandler;
++}
++
++// Observer interface for DataSipper events
++class DataSipperBrowserObserver {
++ public:
++  virtual ~DataSipperBrowserObserver() = default;
++  virtual void OnNetworkEvent(const NetworkEvent& event) = 0;
++  virtual void OnStreamRuleAdded(const StreamRule& rule) = 0;
++  virtual void OnStreamRuleRemoved(const std::string& rule_name) = 0;
++  virtual void OnOutputConnectorStatusChanged(const std::string& name, 
++                                             const std::string& status) = 0;
++};
++
++// Main browser-side service for DataSipper functionality
++class DataSipperBrowserService : public KeyedService,
++                                public datasipper::DataStorageObserver {
++ public:
++  explicit DataSipperBrowserService(content::BrowserContext* browser_context);
++  ~DataSipperBrowserService() override;
++
++  DataSipperBrowserService(const DataSipperBrowserService&) = delete;
++  DataSipperBrowserService& operator=(const DataSipperBrowserService&) = delete;
++
++  // KeyedService implementation
++  void Shutdown() override;
++
++  // Service management
++  void Initialize();
++  bool IsInitialized() const { return initialized_; }
++
++  // Panel management
++  void RegisterPanel(DataSipperPanel* panel);
++  void UnregisterPanel(DataSipperPanel* panel);
++  void ShowPanel();
++  void HidePanel();
++  bool IsPanelVisible() const;
++
++  // Network event handling
++  void OnNetworkEventReceived(std::unique_ptr<NetworkEvent> event);
++  void OnWebSocketMessageReceived(std::unique_ptr<NetworkEvent> event);
++  
++  // Data access
++  std::vector<std::unique_ptr<NetworkEvent>> GetRecentEvents(size_t count = 100);
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsSince(base::Time since);
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsFromStream(
++      const std::string& stream_name, size_t count = 100);
++  
++  // Stream rule management
++  void CreateStreamRule(const StreamRule& rule);
++  void UpdateStreamRule(const std::string& rule_name, const StreamRule& rule);
++  void DeleteStreamRule(const std::string& rule_name);
++  std::vector<StreamRule> GetStreamRules();
++  
++  // Output connector management
++  void ConfigureOutputConnector(const std::string& name, 
++                               const base::Value::Dict& config);
++  void TestOutputConnection(const std::string& name);
++  std::vector<OutputConnector> GetOutputConnectors();
++  
++  // Statistics
++  base::Value::Dict GetStatistics();
++  
++  // Configuration
++  void UpdateConfiguration(const base::Value::Dict& config);
++  base::Value::Dict GetConfiguration();
++  
++  // Transform management
++  void SetTransformCode(const std::string& code);
++  std::string GetTransformCode();
++  
++  // Observer management
++  void AddObserver(DataSipperBrowserObserver* observer);
++  void RemoveObserver(DataSipperBrowserObserver* observer);
++  
++  // Mojo interface binding
++  void BindPageHandler(mojo::PendingReceiver<mojom::PageHandler> receiver);
++  void BindObserver(mojo::PendingRemote<mojom::DataSipperObserver> observer);
++
++  // DataStorageObserver implementation
++  void OnEventStored(const NetworkEvent& event) override;
++  void OnEventsPersisted(size_t count) override;
++  void OnStorageError(const std::string& error) override;
++  void OnCleanupCompleted(size_t events_removed) override;
++
++ private:
++  // Initialization helpers
++  void InitializeDataStorage();
++  void InitializeStreamManager();
++  void InitializeOutputConnectors();
++  
++  // Event processing
++  void ProcessNetworkEvent(std::unique_ptr<NetworkEvent> event);
++  void RouteEventToStreams(const NetworkEvent& event);
++  void ForwardToOutputConnectors(const NetworkEvent& event);
++  
++  // UI communication
++  void NotifyPanelsOfEvent(const NetworkEvent& event);
++  void NotifyPanelsOfStreamUpdate(const StreamRule& rule);
++  void NotifyPanelsOfStatusUpdate(const std::string& component, 
++                                 const std::string& status);
++  
++  // Statistics tracking
++  void UpdateStatistics(const NetworkEvent& event);
++  void ScheduleStatisticsUpdate();
++  void OnStatisticsTimer();
++  
++  content::BrowserContext* browser_context_;
++  bool initialized_ = false;
++  
++  // Core components
++  std::unique_ptr<datasipper::DataStorageService> data_storage_service_;
++  
++  // UI components
++  std::vector<DataSipperPanel*> panels_;
++  
++  // Observers
++  base::ObserverList<DataSipperBrowserObserver> observers_;
++  mojo::RemoteSet<mojom::DataSipperObserver> mojo_observers_;
++  mojo::ReceiverSet<mojom::PageHandler> page_handler_receivers_;
++  
++  // Statistics
++  struct Statistics {
++    size_t total_events = 0;
++    size_t http_events = 0;
++    size_t websocket_events = 0;
++    size_t error_events = 0;
++    base::Time start_time;
++    base::Time last_event_time;
++  } statistics_;
++  
++  // Configuration
++  base::Value::Dict configuration_;
++  std::string transform_code_;
++  
++  // Timers
++  std::unique_ptr<base::RepeatingTimer> statistics_timer_;
++  
++  base::WeakPtrFactory<DataSipperBrowserService> weak_factory_{this};
++};
++
++// Factory for creating DataSipperBrowserService instances
++class DataSipperBrowserServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static DataSipperBrowserService* GetForProfile(Profile* profile);
++  static DataSipperBrowserServiceFactory* GetInstance();
++
++ private:
++  friend struct base::DefaultSingletonTraits<DataSipperBrowserServiceFactory>;
++
++  DataSipperBrowserServiceFactory();
++  ~DataSipperBrowserServiceFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  KeyedService* BuildServiceInstanceFor(
++      content::BrowserContext* context) const override;
++  content::BrowserContext* GetBrowserContextToUse(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++};
++
++}  // namespace datasipper
++
++#endif  // CHROME_BROWSER_DATASIPPER_DATASIPPER_BROWSER_SERVICE_H_
++
++--- /dev/null
+++++ b/chrome/browser/datasipper/datasipper_mojo_interface.mojom
++@@ -0,0 +1,98 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module datasipper.mojom;
++
++import "mojo/public/mojom/base/time.mojom";
++import "mojo/public/mojom/base/values.mojom";
++import "url/mojom/url.mojom";
++
++// Network event data structure for Mojo communication
++struct NetworkEventData {
++  int32 id;
++  url.mojom.Url url;
++  string method;
++  mojo_base.mojom.Time timestamp;
++  string event_type;
++  int32? status_code;
++  string? request_headers;
++  string? response_headers;
++  string? request_body;
++  string? response_body;
++  int64? request_size;
++  int64? response_size;
++  int32? duration_ms;
++  int32? error_code;
++  string? stream_name;
++  string? group_name;
++};
++
++// Stream rule condition for routing configuration
++struct StreamCondition {
++  string field;     // url, method, status, header, body
++  string operator;  // equals, contains, startsWith, regex
++  string value;
++};
++
++// Stream rule configuration
++struct StreamRule {
++  string name;
++  string description;
++  array<StreamCondition> conditions;
++  string logic;     // AND, OR
++  string group;
++  string? output_target;
++  bool enabled;
++  int64 match_count;
++};
++
++// Output connector configuration
++struct OutputConnector {
++  string name;
++  string type;      // kafka, redis, mysql
++  mojo_base.mojom.DictionaryValue config;
++  string status;    // connected, disconnected, error
++  string? error_message;
++  int64 events_sent;
++  mojo_base.mojom.Time last_send_time;
++};
++
++// Observer interface for receiving real-time updates from DataSipper
++interface DataSipperObserver {
++  // Called when a new network event is captured
++  OnNetworkEvent(NetworkEventData event);
++  
++  // Called when stream rules are updated
++  OnStreamRulesChanged(array<StreamRule> rules);
++  
++  // Called when output connector status changes
++  OnOutputConnectorStatusChanged(string name, string status);
++  
++  // Called with periodic statistics updates
++  OnStatisticsUpdate(mojo_base.mojom.DictionaryValue stats);
++};
++
++// Main interface for DataSipper WebUI communication
++interface PageHandler {
++  // Data retrieval
++  GetNetworkEvents(int32? since_id) => (array<NetworkEventData> events);
++  GetEventDetails(int32 event_id) => (NetworkEventData? event);
++  GetStreamRules() => (array<StreamRule> rules);
++  GetOutputConnectors() => (array<OutputConnector> connectors);
++  GetStatistics() => (mojo_base.mojom.DictionaryValue stats);
++  GetConfiguration() => (mojo_base.mojom.DictionaryValue config);
++  GetTransformCode() => (string code);
++  
++  // Stream rule management
++  CreateStreamRule(StreamRule rule) => (bool success);
++  UpdateStreamRule(string rule_name, StreamRule rule) => (bool success);
++  DeleteStreamRule(string rule_name) => (bool success);
++  
++  // Output connector management
++  ConfigureOutputConnector(string name, mojo_base.mojom.DictionaryValue config) => (bool success);
++  TestConnection(string connector_name) => (bool success, string message);
++  
++  // Configuration and control
++  UpdateConfiguration(mojo_base.mojom.DictionaryValue config) => (bool success);
++  SetTransformCode(string code) => (bool success);
++  ClearEvents() => (bool success);
++  PauseCapture(bool paused) => (bool success);
++  
++  // Observer registration
++  AddObserver(pending_remote<DataSipperObserver> observer);
++};
++
++// Factory interface for creating PageHandler instances
++interface PageHandlerFactory {
++  CreatePageHandler(pending_receiver<PageHandler> handler);
++};

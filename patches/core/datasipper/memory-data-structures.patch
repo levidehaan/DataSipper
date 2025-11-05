@@ -1,0 +1,611 @@
+# DataSipper: In-memory data structures for high-performance operations
+#
+# This patch implements efficient in-memory data structures for real-time
+# network event processing, including circular buffers, event queues,
+# and stream management with thread-safe operations.
+#
+# Affects:
+# - components/datasipper/storage/ (new directory)
+# - High-performance circular buffers and event queues
+
+--- /dev/null
++++ b/components/datasipper/storage/circular_event_buffer.h
+@@ -0,0 +1,128 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_
++#define COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_
++
++#include <memory>
++#include <vector>
++#include <functional>
++
++#include "base/memory/weak_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++#include "base/time/time.h"
++#include "components/datasipper/common/network_event.h"
++
++namespace datasipper {
++
++// Observer interface for buffer events
++class CircularEventBufferObserver {
++ public:
++  virtual ~CircularEventBufferObserver() = default;
++  virtual void OnEventAdded(const NetworkEvent& event) = 0;
++  virtual void OnEventEvicted(const NetworkEvent& event) = 0;
++  virtual void OnBufferFull() = 0;
++};
++
++// High-performance circular buffer for network events
++// Thread-safe implementation optimized for high-frequency writes
++class CircularEventBuffer {
++ public:
++  explicit CircularEventBuffer(size_t capacity = 10000);
++  ~CircularEventBuffer();
++
++  CircularEventBuffer(const CircularEventBuffer&) = delete;
++  CircularEventBuffer& operator=(const CircularEventBuffer&) = delete;
++
++  // Event operations
++  void AddEvent(std::unique_ptr<NetworkEvent> event);
++  std::vector<std::unique_ptr<NetworkEvent>> GetEvents(size_t max_count = 0) const;
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsSince(base::Time since) const;
++  std::unique_ptr<NetworkEvent> GetEvent(const std::string& event_id) const;
++  
++  // Filtering operations
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsByStream(
++      const std::string& stream_name, size_t max_count = 0) const;
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsByGroup(
++      const std::string& group_name, size_t max_count = 0) const;
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsByUrl(
++      const std::string& url_pattern, size_t max_count = 0) const;
++  
++  // Statistics
++  size_t GetSize() const;
++  size_t GetCapacity() const { return capacity_; }
++  size_t GetTotalEventsAdded() const;
++  size_t GetTotalEventsEvicted() const;
++  base::Time GetOldestEventTime() const;
++  base::Time GetNewestEventTime() const;
++  
++  // Configuration
++  void SetCapacity(size_t new_capacity);
++  void Clear();
++  
++  // Observer management
++  void AddObserver(CircularEventBufferObserver* observer);
++  void RemoveObserver(CircularEventBufferObserver* observer);
++  
++  // Memory management
++  size_t GetMemoryUsageBytes() const;
++  void TrimToSize(size_t target_size);
++  
++ private:
++  struct EventSlot {
++    std::unique_ptr<NetworkEvent> event;
++    size_t sequence_number = 0;
++    bool is_valid = false;
++  };
++  
++  void NotifyEventAdded(const NetworkEvent& event);
++  void NotifyEventEvicted(const NetworkEvent& event);
++  void NotifyBufferFull();
++  
++  bool MatchesUrlPattern(const std::string& url, const std::string& pattern) const;
++  
++  mutable base::Lock lock_;
++  
++  std::vector<EventSlot> buffer_ GUARDED_BY(lock_);
++  size_t capacity_;
++  size_t head_index_ GUARDED_BY(lock_) = 0;
++  size_t size_ GUARDED_BY(lock_) = 0;
++  size_t sequence_counter_ GUARDED_BY(lock_) = 0;
++  
++  // Statistics
++  size_t total_events_added_ GUARDED_BY(lock_) = 0;
++  size_t total_events_evicted_ GUARDED_BY(lock_) = 0;
++  
++  std::vector<CircularEventBufferObserver*> observers_ GUARDED_BY(lock_);
++  
++  base::WeakPtrFactory<CircularEventBuffer> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_
+--- /dev/null
++++ b/components/datasipper/storage/circular_event_buffer.cc
+@@ -0,0 +1,312 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/storage/circular_event_buffer.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/threading/thread_checker.h"
++
++namespace datasipper {
++
++CircularEventBuffer::CircularEventBuffer(size_t capacity) 
++    : capacity_(capacity) {
++  DCHECK_GT(capacity, 0);
++  buffer_.resize(capacity_);
++  DVLOG(1) << "Created CircularEventBuffer with capacity: " << capacity_;
++}
++
++CircularEventBuffer::~CircularEventBuffer() {
++  base::AutoLock auto_lock(lock_);
++  DVLOG(1) << "Destroying CircularEventBuffer. Total events processed: " 
++           << total_events_added_;
++}
++
++void CircularEventBuffer::AddEvent(std::unique_ptr<NetworkEvent> event) {
++  if (!event) {
++    LOG(WARNING) << "Attempted to add null event to buffer";
++    return;
++  }
++
++  base::AutoLock auto_lock(lock_);
++  
++  // Calculate insertion index
++  size_t insert_index = (head_index_ + size_) % capacity_;
++  
++  // Check if we're about to evict an event
++  std::unique_ptr<NetworkEvent> evicted_event;
++  if (size_ == capacity_) {
++    // Buffer is full, we'll evict the oldest event
++    evicted_event = std::move(buffer_[head_index_].event);
++    total_events_evicted_++;
++    
++    // Move head forward
++    head_index_ = (head_index_ + 1) % capacity_;
++  } else {
++    // Buffer has space
++    size_++;
++  }
++  
++  // Insert new event
++  buffer_[insert_index].event = std::move(event);
++  buffer_[insert_index].sequence_number = ++sequence_counter_;
++  buffer_[insert_index].is_valid = true;
++  
++  total_events_added_++;
++  
++  // Notify observers (outside lock to avoid deadlock)
++  NetworkEvent* added_event = buffer_[insert_index].event.get();
++  std::vector<CircularEventBufferObserver*> observers_copy = observers_;
++  
++  lock_.Release();
++  
++  // Notify about evicted event first
++  if (evicted_event) {
++    for (auto* observer : observers_copy) {
++      observer->OnEventEvicted(*evicted_event);
++    }
++  }
++  
++  // Notify about added event
++  for (auto* observer : observers_copy) {
++    observer->OnEventAdded(*added_event);
++  }
++  
++  // Notify if buffer became full
++  if (size_ == capacity_) {
++    for (auto* observer : observers_copy) {
++      observer->OnBufferFull();
++    }
++  }
++  
++  lock_.Acquire();
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++CircularEventBuffer::GetEvents(size_t max_count) const {
++  base::AutoLock auto_lock(lock_);
++  
++  std::vector<std::unique_ptr<NetworkEvent>> events;
++  
++  if (size_ == 0) {
++    return events;
++  }
++  
++  size_t count = (max_count > 0) ? std::min(max_count, size_) : size_;
++  events.reserve(count);
++  
++  // Start from the oldest event (head) and go forward
++  for (size_t i = 0; i < count; ++i) {
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event) {
++      // Create a copy of the event
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;  // Copy constructor
++      events.push_back(std::move(event_copy));
++    }
++  }
++  
++  return events;
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++CircularEventBuffer::GetEventsSince(base::Time since) const {
++  base::AutoLock auto_lock(lock_);
++  
++  std::vector<std::unique_ptr<NetworkEvent>> events;
++  
++  if (size_ == 0) {
++    return events;
++  }
++  
++  // Iterate through all events and filter by timestamp
++  for (size_t i = 0; i < size_; ++i) {
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event &&
++        buffer_[index].event->timestamp >= since) {
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;
++      events.push_back(std::move(event_copy));
++    }
++  }
++  
++  return events;
++}
++
++std::unique_ptr<NetworkEvent> 
++CircularEventBuffer::GetEvent(const std::string& event_id) const {
++  base::AutoLock auto_lock(lock_);
++  
++  for (size_t i = 0; i < size_; ++i) {
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event &&
++        buffer_[index].event->id == event_id) {
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;
++      return event_copy;
++    }
++  }
++  
++  return nullptr;
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++CircularEventBuffer::GetEventsByStream(const std::string& stream_name, 
++                                       size_t max_count) const {
++  base::AutoLock auto_lock(lock_);
++  
++  std::vector<std::unique_ptr<NetworkEvent>> events;
++  
++  if (size_ == 0 || stream_name.empty()) {
++    return events;
++  }
++  
++  size_t count = 0;
++  for (size_t i = 0; i < size_; ++i) {
++    if (max_count > 0 && count >= max_count) {
++      break;
++    }
++    
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event &&
++        buffer_[index].event->stream_name == stream_name) {
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;
++      events.push_back(std::move(event_copy));
++      count++;
++    }
++  }
++  
++  return events;
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++CircularEventBuffer::GetEventsByGroup(const std::string& group_name, 
++                                      size_t max_count) const {
++  base::AutoLock auto_lock(lock_);
++  
++  std::vector<std::unique_ptr<NetworkEvent>> events;
++  
++  if (size_ == 0 || group_name.empty()) {
++    return events;
++  }
++  
++  size_t count = 0;
++  for (size_t i = 0; i < size_; ++i) {
++    if (max_count > 0 && count >= max_count) {
++      break;
++    }
++    
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event &&
++        buffer_[index].event->group_name == group_name) {
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;
++      events.push_back(std::move(event_copy));
++      count++;
++    }
++  }
++  
++  return events;
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++CircularEventBuffer::GetEventsByUrl(const std::string& url_pattern, 
++                                    size_t max_count) const {
++  base::AutoLock auto_lock(lock_);
++  
++  std::vector<std::unique_ptr<NetworkEvent>> events;
++  
++  if (size_ == 0 || url_pattern.empty()) {
++    return events;
++  }
++  
++  size_t count = 0;
++  for (size_t i = 0; i < size_; ++i) {
++    if (max_count > 0 && count >= max_count) {
++      break;
++    }
++    
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].event &&
++        MatchesUrlPattern(buffer_[index].event->url.spec(), url_pattern)) {
++      auto event_copy = std::make_unique<NetworkEvent>();
++      *event_copy = *buffer_[index].event;
++      events.push_back(std::move(event_copy));
++      count++;
++    }
++  }
++  
++  return events;
++}
++
++size_t CircularEventBuffer::GetSize() const {
++  base::AutoLock auto_lock(lock_);
++  return size_;
++}
++
++size_t CircularEventBuffer::GetTotalEventsAdded() const {
++  base::AutoLock auto_lock(lock_);
++  return total_events_added_;
++}
++
++size_t CircularEventBuffer::GetTotalEventsEvicted() const {
++  base::AutoLock auto_lock(lock_);
++  return total_events_evicted_;
++}
++
++base::Time CircularEventBuffer::GetOldestEventTime() const {
++  base::AutoLock auto_lock(lock_);
++  
++  if (size_ == 0) {
++    return base::Time();
++  }
++  
++  if (buffer_[head_index_].is_valid && buffer_[head_index_].event) {
++    return buffer_[head_index_].event->timestamp;
++  }
++  
++  return base::Time();
++}
++
++base::Time CircularEventBuffer::GetNewestEventTime() const {
++  base::AutoLock auto_lock(lock_);
++  
++  if (size_ == 0) {
++    return base::Time();
++  }
++  
++  // Find the newest event (highest sequence number)
++  size_t newest_index = head_index_;
++  size_t highest_sequence = 0;
++  
++  for (size_t i = 0; i < size_; ++i) {
++    size_t index = (head_index_ + i) % capacity_;
++    if (buffer_[index].is_valid && buffer_[index].sequence_number > highest_sequence) {
++      highest_sequence = buffer_[index].sequence_number;
++      newest_index = index;
++    }
++  }
++  
++  if (buffer_[newest_index].event) {
++    return buffer_[newest_index].event->timestamp;
++  }
++  
++  return base::Time();
++}
++
++void CircularEventBuffer::Clear() {
++  base::AutoLock auto_lock(lock_);
++  
++  for (auto& slot : buffer_) {
++    slot.event.reset();
++    slot.is_valid = false;
++    slot.sequence_number = 0;
++  }
++  
++  head_index_ = 0;
++  size_ = 0;
++  
++  DVLOG(1) << "CircularEventBuffer cleared";
++}
++
++void CircularEventBuffer::AddObserver(CircularEventBufferObserver* observer) {
++  base::AutoLock auto_lock(lock_);
++  observers_.push_back(observer);
++}
++
++void CircularEventBuffer::RemoveObserver(CircularEventBufferObserver* observer) {
++  base::AutoLock auto_lock(lock_);
++  auto it = std::find(observers_.begin(), observers_.end(), observer);
++  if (it != observers_.end()) {
++    observers_.erase(it);
++  }
++}
++
++bool CircularEventBuffer::MatchesUrlPattern(const std::string& url, 
++                                           const std::string& pattern) const {
++  // Simple wildcard matching for now
++  // TODO: Implement more sophisticated pattern matching
++  if (pattern == "*") {
++    return true;
++  }
++  
++  if (pattern.find('*') == std::string::npos) {
++    // No wildcards, do exact match
++    return url == pattern;
++  }
++  
++  // Basic wildcard support
++  return base::MatchPattern(url, pattern);
++}
++
++}  // namespace datasipper
+--- /dev/null
++++ b/components/datasipper/storage/event_stream_manager.h
+@@ -0,0 +1,142 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STORAGE_EVENT_STREAM_MANAGER_H_
++#define COMPONENTS_DATASIPPER_STORAGE_EVENT_STREAM_MANAGER_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/synchronization/lock.h"
++#include "base/thread_annotations.h"
++#include "components/datasipper/common/network_event.h"
++#include "components/datasipper/storage/circular_event_buffer.h"
++
++namespace datasipper {
++
++class StreamRule;
++class StreamGroup;
++
++// Observer interface for stream events
++class EventStreamObserver {
++ public:
++  virtual ~EventStreamObserver() = default;
++  virtual void OnStreamCreated(const std::string& stream_name) = 0;
++  virtual void OnStreamDestroyed(const std::string& stream_name) = 0;
++  virtual void OnEventRouted(const std::string& stream_name, 
++                           const NetworkEvent& event) = 0;
++  virtual void OnStreamStatisticsUpdated(const std::string& stream_name) = 0;
++};
++
++// Statistics for individual streams
++struct StreamStatistics {
++  size_t total_events = 0;
++  size_t events_per_minute = 0;
++  base::Time first_event_time;
++  base::Time last_event_time;
++  size_t total_bytes_processed = 0;
++  std::map<std::string, size_t> content_type_counts;
++  std::map<int, size_t> status_code_counts;
++  double avg_response_time_ms = 0.0;
++  size_t error_count = 0;
++};
++
++// Manages multiple event streams with routing and buffering
++class EventStreamManager : public CircularEventBufferObserver {
++ public:
++  explicit EventStreamManager(size_t default_buffer_size = 10000);
++  ~EventStreamManager() override;
++
++  EventStreamManager(const EventStreamManager&) = delete;
++  EventStreamManager& operator=(const EventStreamManager&) = delete;
++
++  // Stream management
++  void CreateStream(const std::string& stream_name, size_t buffer_size = 0);
++  void DestroyStream(const std::string& stream_name);
++  bool HasStream(const std::string& stream_name) const;
++  std::vector<std::string> GetStreamNames() const;
++  
++  // Event routing
++  void RouteEvent(std::unique_ptr<NetworkEvent> event, 
++                  const std::string& target_stream = "");
++  void RouteEventToMultipleStreams(std::unique_ptr<NetworkEvent> event,
++                                  const std::vector<std::string>& stream_names);
++  
++  // Event retrieval
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsFromStream(
++      const std::string& stream_name, size_t max_count = 0) const;
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsFromAllStreams(
++      size_t max_count = 0) const;
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsSince(
++      const std::string& stream_name, base::Time since) const;
++  
++  // Stream statistics
++  StreamStatistics GetStreamStatistics(const std::string& stream_name) const;
++  std::map<std::string, StreamStatistics> GetAllStreamStatistics() const;
++  void UpdateStreamStatistics();
++  
++  // Configuration
++  void SetDefaultBufferSize(size_t size);
++  size_t GetDefaultBufferSize() const { return default_buffer_size_; }
++  
++  // Observer management
++  void AddObserver(EventStreamObserver* observer);
++  void RemoveObserver(EventStreamObserver* observer);
++  
++  // Memory management
++  size_t GetTotalMemoryUsage() const;
++  void TrimAllStreams(size_t target_size_per_stream);
++  void ClearAllStreams();
++  
++  // CircularEventBufferObserver implementation
++  void OnEventAdded(const NetworkEvent& event) override;
++  void OnEventEvicted(const NetworkEvent& event) override;
++  void OnBufferFull() override;
++  
++ private:
++  struct StreamInfo {
++    std::unique_ptr<CircularEventBuffer> buffer;
++    StreamStatistics statistics;
++    base::Time created_time;
++    
++    StreamInfo(size_t buffer_size);
++    ~StreamInfo();
++  };
++  
++  std::string DetermineTargetStream(const NetworkEvent& event) const;
++  void UpdateStatisticsForEvent(const std::string& stream_name, 
++                               const NetworkEvent& event);
++  void NotifyStreamCreated(const std::string& stream_name);
++  void NotifyStreamDestroyed(const std::string& stream_name);
++  void NotifyEventRouted(const std::string& stream_name, 
++                        const NetworkEvent& event);
++  void NotifyStatisticsUpdated(const std::string& stream_name);
++  
++  mutable base::Lock lock_;
++  
++  // Stream storage
++  std::map<std::string, std::unique_ptr<StreamInfo>> streams_ GUARDED_BY(lock_);
++  size_t default_buffer_size_;
++  
++  // Default stream for unrouted events
++  static constexpr char kDefaultStreamName[] = "default";
++  
++  // Observers
++  base::ObserverList<EventStreamObserver> observers_;
++  
++  // Statistics update timer
++  base::Time last_statistics_update_;
++  
++  base::WeakPtrFactory<EventStreamManager> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STORAGE_EVENT_STREAM_MANAGER_H_

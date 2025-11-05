@@ -1,0 +1,38 @@
+// Copyright 2024 The DataSipper Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+module datasipper.mojom;
+
+import "mojo/public/mojom/base/time.mojom";
+
+// Network request/response data captured by network service
+struct NetworkRequestData {
+  string request_id;
+  string url;
+  string method;  // GET, POST, etc.
+  string type;    // "xhr", "fetch", "websocket", "document", etc.
+  int64 timestamp_ms;
+  int32 status_code;
+  string status_text;
+  map<string, string> request_headers;
+  map<string, string> response_headers;
+  string request_body;
+  string response_body;
+  int64 size_bytes;
+  int64 duration_ms;
+};
+
+// Interface implemented by browser process to receive network events
+// from the network service process
+interface DataSipperNetworkClient {
+  // Called when a network request is captured and completed
+  OnNetworkRequestCaptured(NetworkRequestData request);
+};
+
+// Interface provided by network service for browser to register
+// as a client for network events
+interface DataSipperNetworkHost {
+  // Register a client to receive network request notifications
+  AddClient(pending_remote<DataSipperNetworkClient> client);
+};

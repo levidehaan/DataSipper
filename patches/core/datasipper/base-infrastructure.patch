@@ -1,0 +1,50 @@
+# DataSipper: Base infrastructure and configuration system
+#
+# This patch adds the foundational DataSipper infrastructure including:
+# - Feature flags and configuration system
+# - Base classes and interfaces
+# - Build system integration
+#
+# Affects:
+# - chrome/common/chrome_features.cc/h
+# - components/BUILD.gn
+# - content/public/browser/BUILD.gn
+
+--- a/chrome/common/chrome_features.cc
++++ b/chrome/common/chrome_features.cc
+@@ -500,6 +500,12 @@ const base::Feature kDesktopPWAsTabStripLinkCapturing{
+     "DesktopPWAsTabStripLinkCapturing", base::FEATURE_DISABLED_BY_DEFAULT};
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
++// DataSipper features
++const base::Feature kDataSipperEnabled{"DataSipperEnabled",
++                                       base::FEATURE_ENABLED_BY_DEFAULT};
++const base::Feature kDataSipperNetworkInterception{
++    "DataSipperNetworkInterception", base::FEATURE_ENABLED_BY_DEFAULT};
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ const base::Feature kDesktopPWAsRunOnOsLoginBehavior{
+     "DesktopPWAsRunOnOsLoginBehavior", base::FEATURE_DISABLED_BY_DEFAULT};
+--- a/chrome/common/chrome_features.h
++++ b/chrome/common/chrome_features.h
+@@ -80,6 +80,9 @@ COMPONENT_EXPORT(CHROME_FEATURES) extern const base::Feature kDesktopPWAs;
+ COMPONENT_EXPORT(CHROME_FEATURES)
+ extern const base::Feature kDesktopPWAsTabStripLinkCapturing;
+ 
++// DataSipper features
++COMPONENT_EXPORT(CHROME_FEATURES) extern const base::Feature kDataSipperEnabled;
++COMPONENT_EXPORT(CHROME_FEATURES) extern const base::Feature kDataSipperNetworkInterception;
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ COMPONENT_EXPORT(CHROME_FEATURES)
+ extern const base::Feature kDesktopPWAsRunOnOsLoginBehavior;
+--- a/components/BUILD.gn
++++ b/components/BUILD.gn
+@@ -42,6 +42,7 @@ group("components") {
+     "//components/crash/content/browser",
+     "//components/crash/core/app",
+     "//components/custom_handlers/",
++    "//components/datasipper",
+     "//components/device_event_log",
+     "//components/device_signals",
+     "//components/discardable_memory/client",

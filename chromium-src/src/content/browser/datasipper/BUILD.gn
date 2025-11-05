@@ -1,0 +1,22 @@
+# Copyright 2024 The DataSipper Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/features.gni")
+
+# DataSipper content browser integration
+source_set("datasipper") {
+  sources = [
+    "datasipper_network_service_observer.cc",
+    "datasipper_network_service_observer.h",
+  ]
+
+  deps = [
+    "//base",
+    "//chrome/browser/datasipper",
+    "//components/datasipper",
+    "//content/public/browser",
+    "//mojo/public/cpp/bindings",
+    "//services/network/public/mojom",
+  ]
+}

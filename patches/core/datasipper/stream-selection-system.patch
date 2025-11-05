@@ -1,0 +1,377 @@
+# DataSipper: Stream selection and grouping system
+#
+# This patch implements the stream selection engine that allows users to
+# group and route network data streams based on patterns, endpoints, and rules.
+#
+# Affects:
+# - components/datasipper/stream/ (new directory)
+# - components/datasipper/stream/stream_selector.h (new file)
+# - components/datasipper/stream/stream_selector.cc (new file)
+# - components/datasipper/stream/stream_rule.h (new file)
+# - components/datasipper/stream/stream_group.h (new file)
+
+--- /dev/null
++++ b/components/datasipper/stream/stream_rule.h
+@@ -0,0 +1,120 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STREAM_STREAM_RULE_H_
++#define COMPONENTS_DATASIPPER_STREAM_STREAM_RULE_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "url/gurl.h"
++
++namespace datasipper {
++
++// Types of stream matching criteria
++enum class StreamMatchType {
++  URL_PATTERN,          // Match URL with wildcards/regex
++  HOST_EXACT,           // Exact hostname match
++  PATH_PREFIX,          // URL path starts with prefix
++  METHOD_EXACT,         // HTTP method match
++  HEADER_CONTAINS,      // Header contains value
++  WEBSOCKET_PROTOCOL,   // WebSocket subprotocol
++  CONTENT_TYPE,         // Response content type
++  STATUS_CODE,          // HTTP status code
++  CUSTOM_JAVASCRIPT     // Custom JavaScript matcher
++};
++
++// Stream rule condition
++struct StreamCondition {
++  StreamMatchType type;
++  std::string pattern;      // Pattern to match against
++  std::string value;        // Expected value (for exact matches)
++  bool case_sensitive = false;
++  bool negate = false;      // Invert match result
++  
++  StreamCondition();
++  StreamCondition(StreamMatchType type, const std::string& pattern);
++  StreamCondition(StreamMatchType type, const std::string& pattern, const std::string& value);
++  ~StreamCondition();
++  
++  // Convert to/from base::Value for persistence
++  base::Value::Dict ToDict() const;
++  static std::unique_ptr<StreamCondition> FromDict(const base::Value::Dict& dict);
++};
++
++// Complete stream rule with multiple conditions
++class StreamRule {
++ public:
++  StreamRule();
++  explicit StreamRule(const std::string& name);
++  ~StreamRule();
++  
++  StreamRule(const StreamRule&) = delete;
++  StreamRule& operator=(const StreamRule&) = delete;
++  
++  StreamRule(StreamRule&& other);
++  StreamRule& operator=(StreamRule&& other);
++
++  // Basic properties
++  const std::string& name() const { return name_; }
++  void set_name(const std::string& name) { name_ = name; }
++  
++  const std::string& description() const { return description_; }
++  void set_description(const std::string& description) { description_ = description; }
++  
++  bool enabled() const { return enabled_; }
++  void set_enabled(bool enabled) { enabled_ = enabled; }
++  
++  // Condition management
++  void AddCondition(std::unique_ptr<StreamCondition> condition);
++  void RemoveCondition(size_t index);
++  const std::vector<std::unique_ptr<StreamCondition>>& conditions() const { return conditions_; }
++  
++  // Logic mode for combining conditions
++  enum class LogicMode {
++    AND,  // All conditions must match
++    OR    // Any condition can match
++  };
++  
++  LogicMode logic_mode() const { return logic_mode_; }
++  void set_logic_mode(LogicMode mode) { logic_mode_ = mode; }
++  
++  // Stream grouping
++  const std::string& group_name() const { return group_name_; }
++  void set_group_name(const std::string& group_name) { group_name_ = group_name; }
++  
++  // Output routing
++  const std::string& output_target() const { return output_target_; }
++  void set_output_target(const std::string& target) { output_target_ = target; }
++  
++  // Matching
++  bool Matches(const base::Value::Dict& event_data) const;
++  
++  // Serialization
++  base::Value::Dict ToDict() const;
++  static std::unique_ptr<StreamRule> FromDict(const base::Value::Dict& dict);
++  
++ private:
++  bool EvaluateCondition(const StreamCondition& condition, 
++                        const base::Value::Dict& event_data) const;
++  bool MatchesURL(const StreamCondition& condition, const std::string& url) const;
++  bool MatchesPattern(const std::string& pattern, const std::string& text, 
++                     bool case_sensitive) const;
++  
++  std::string name_;
++  std::string description_;
++  bool enabled_ = true;
++  LogicMode logic_mode_ = LogicMode::AND;
++  std::string group_name_;
++  std::string output_target_;
++  
++  std::vector<std::unique_ptr<StreamCondition>> conditions_;
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STREAM_STREAM_RULE_H_
+--- /dev/null
++++ b/components/datasipper/stream/stream_group.h
+@@ -0,0 +1,108 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STREAM_STREAM_GROUP_H_
++#define COMPONENTS_DATASIPPER_STREAM_STREAM_GROUP_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/observer_list.h"
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace datasipper {
++
++struct NetworkEvent;
++
++// Configuration for data transformation
++struct TransformationConfig {
++  bool enabled = false;
++  std::string javascript_code;         // Custom transformation script
++  std::string output_format = "json";  // json, avro, protobuf, custom
++  base::Value::Dict field_mappings;    // Field name mappings
++  base::Value::Dict static_fields;     // Static fields to add
++  bool include_metadata = true;        // Include timing, source info
++  
++  base::Value::Dict ToDict() const;
++  static TransformationConfig FromDict(const base::Value::Dict& dict);
++};
++
++// Configuration for output routing
++struct OutputConfig {
++  std::string type;                    // "kafka", "redis", "webhook", "file"
++  bool enabled = false;
++  
++  // Kafka-specific config
++  std::string kafka_topic;
++  int kafka_partition = -1;            // -1 for automatic partitioning
++  std::string kafka_key_field;        // Field to use as message key
++  
++  // Redis-specific config
++  std::string redis_key_pattern;      // Key pattern with substitutions
++  std::string redis_channel;          // Pub/sub channel
++  std::string redis_operation = "set"; // set, lpush, rpush, publish
++  int redis_ttl = -1;                 // TTL in seconds, -1 for no expiry
++  
++  // Webhook-specific config
++  std::string webhook_url;
++  std::string webhook_method = "POST";
++  base::Value::Dict webhook_headers;
++  
++  // File-specific config
++  std::string file_path;
++  std::string file_format = "jsonl";  // jsonl, csv, tsv
++  bool file_append = true;
++  
++  // Common config
++  int batch_size = 1;                 // Number of events to batch
++  int flush_interval_ms = 1000;       // Max time to wait before flushing
++  int max_retries = 3;
++  int retry_delay_ms = 1000;
++  
++  base::Value::Dict ToDict() const;
++  static OutputConfig FromDict(const base::Value::Dict& dict);
++};
++
++// Observer for stream group events
++class StreamGroupObserver {
++ public:
++  virtual ~StreamGroupObserver() = default;
++  virtual void OnEventAdded(const std::string& group_name, const NetworkEvent& event) = 0;
++  virtual void OnTransformationApplied(const std::string& group_name, const base::Value::Dict& transformed_data) = 0;
++  virtual void OnOutputSent(const std::string& group_name, const std::string& output_type, bool success) = 0;
++};
++
++// A group of related network events with transformation and output configuration
++class StreamGroup {
++ public:
++  explicit StreamGroup(const std::string& name);
++  ~StreamGroup();
++  
++  StreamGroup(const StreamGroup&) = delete;
++  StreamGroup& operator=(const StreamGroup&) = delete;
++
++  // Basic properties
++  const std::string& name() const { return name_; }
++  const std::string& description() const { return description_; }
++  void set_description(const std::string& description) { description_ = description; }
++  
++  bool enabled() const { return enabled_; }
++  void set_enabled(bool enabled) { enabled_ = enabled; }
++  
++  // Configuration
++  const TransformationConfig& transformation_config() const { return transformation_config_; }
++  void set_transformation_config(const TransformationConfig& config) { transformation_config_ = config; }
++  
++  const OutputConfig& output_config() const { return output_config_; }
++  void set_output_config(const OutputConfig& config) { output_config_ = config; }
++  
++  // Event processing
++  void AddEvent(const NetworkEvent& event);
++  size_t GetEventCount() const { return event_count_; }
++  base::Time GetLastEventTime() const { return last_event_time_; }
++  
++  // Observer management
++  void AddObserver(StreamGroupObserver* observer);
++  void RemoveObserver(StreamGroupObserver* observer);
++  
++  // Statistics
++  size_t GetTransformationCount() const { return transformation_count_; }
++  size_t GetOutputSuccessCount() const { return output_success_count_; }
++  size_t GetOutputFailureCount() const { return output_failure_count_; }
++  
++  // Serialization
++  base::Value::Dict ToDict() const;
++  static std::unique_ptr<StreamGroup> FromDict(const base::Value::Dict& dict);
++  
++ private:
++  void ProcessEvent(const NetworkEvent& event);
++  base::Value::Dict TransformEvent(const NetworkEvent& event);
++  void SendToOutput(const base::Value::Dict& data);
++  
++  std::string name_;
++  std::string description_;
++  bool enabled_ = true;
++  
++  TransformationConfig transformation_config_;
++  OutputConfig output_config_;
++  
++  // Statistics
++  size_t event_count_ = 0;
++  size_t transformation_count_ = 0;
++  size_t output_success_count_ = 0;
++  size_t output_failure_count_ = 0;
++  base::Time last_event_time_;
++  
++  base::ObserverList<StreamGroupObserver> observers_;
++  
++  // Batching support
++  std::vector<base::Value::Dict> pending_batch_;
++  base::Time last_flush_time_;
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STREAM_STREAM_GROUP_H_
+--- /dev/null
++++ b/components/datasipper/stream/stream_selector.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STREAM_STREAM_SELECTOR_H_
++#define COMPONENTS_DATASIPPER_STREAM_STREAM_SELECTOR_H_
++
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "components/datasipper/stream/stream_group.h"
++#include "components/datasipper/stream/stream_rule.h"
++
++namespace datasipper {
++
++struct NetworkEvent;
++
++// Observer for stream selector events
++class StreamSelectorObserver {
++ public:
++  virtual ~StreamSelectorObserver() = default;
++  virtual void OnRuleAdded(const std::string& rule_name) = 0;
++  virtual void OnRuleRemoved(const std::string& rule_name) = 0;
++  virtual void OnRuleUpdated(const std::string& rule_name) = 0;
++  virtual void OnGroupCreated(const std::string& group_name) = 0;
++  virtual void OnEventRouted(const std::string& group_name, const NetworkEvent& event) = 0;
++};
++
++// Main stream selection engine that routes network events to appropriate groups
++class StreamSelector : public StreamGroupObserver {
++ public:
++  StreamSelector();
++  ~StreamSelector() override;
++  
++  StreamSelector(const StreamSelector&) = delete;
++  StreamSelector& operator=(const StreamSelector&) = delete;
++
++  // Rule management
++  void AddRule(std::unique_ptr<StreamRule> rule);
++  void RemoveRule(const std::string& rule_name);
++  void UpdateRule(const std::string& rule_name, std::unique_ptr<StreamRule> rule);
++  StreamRule* GetRule(const std::string& rule_name);
++  std::vector<std::string> GetRuleNames() const;
++  
++  // Group management
++  void CreateGroup(const std::string& group_name);
++  void RemoveGroup(const std::string& group_name);
++  StreamGroup* GetGroup(const std::string& group_name);
++  std::vector<std::string> GetGroupNames() const;
++  void UpdateGroupConfig(const std::string& group_name, 
++                        const TransformationConfig& transform_config,
++                        const OutputConfig& output_config);
++  
++  // Event processing
++  void ProcessEvent(const NetworkEvent& event);
++  
++  // Observer management
++  void AddObserver(StreamSelectorObserver* observer);
++  void RemoveObserver(StreamSelectorObserver* observer);
++  
++  // StreamGroupObserver implementation
++  void OnEventAdded(const std::string& group_name, const NetworkEvent& event) override;
++  void OnTransformationApplied(const std::string& group_name, const base::Value::Dict& transformed_data) override;
++  void OnOutputSent(const std::string& group_name, const std::string& output_type, bool success) override;
++  
++  // Configuration persistence
++  base::Value::Dict ExportConfiguration() const;
++  bool ImportConfiguration(const base::Value::Dict& config);
++  void ClearConfiguration();
++  
++ private:
++  void EnsureDefaultGroup();
++  std::vector<std::string> FindMatchingGroups(const NetworkEvent& event);
++  
++  std::map<std::string, std::unique_ptr<StreamRule>> rules_;
++  std::map<std::string, std::unique_ptr<StreamGroup>> groups_;
++  
++  base::ObserverList<StreamSelectorObserver> observers_;
++  
++  base::WeakPtrFactory<StreamSelector> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STREAM_STREAM_SELECTOR_H_

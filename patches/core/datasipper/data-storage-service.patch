@@ -1,0 +1,719 @@
+# DataSipper: Comprehensive data storage service
+#
+# This patch creates a unified data storage service that coordinates between
+# SQLite persistence, in-memory buffers, and stream management for optimal
+# performance and reliability.
+#
+# Affects:
+# - components/datasipper/storage/data_storage_service.h/cc (new files)
+# - Integration of all storage components
+
+--- /dev/null
++++ b/components/datasipper/storage/data_storage_service.h
+@@ -0,0 +1,187 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STORAGE_DATA_STORAGE_SERVICE_H_
++#define COMPONENTS_DATASIPPER_STORAGE_DATA_STORAGE_SERVICE_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/timer/timer.h"
++#include "components/datasipper/common/network_event.h"
++#include "components/datasipper/storage/event_stream_manager.h"
++#include "sql/database.h"
++
++class Profile;
++
++namespace datasipper {
++
++class CircularEventBuffer;
++class DataSipperDatabase;
++
++// Configuration for data storage behavior
++struct DataStorageConfig {
++  // Memory buffer settings
++  size_t memory_buffer_size = 10000;
++  size_t max_memory_usage_mb = 100;
++  
++  // Database settings
++  bool enable_persistence = true;
++  int retention_days = 7;
++  size_t max_db_size_mb = 500;
++  
++  // Performance settings
++  size_t batch_insert_size = 100;
++  base::TimeDelta flush_interval = base::Seconds(30);
++  base::TimeDelta cleanup_interval = base::Hours(24);
++  
++  // Stream settings
++  size_t max_streams = 50;
++  size_t default_stream_buffer_size = 1000;
++  
++  // Data capture settings
++  bool capture_request_bodies = true;
++  bool capture_response_bodies = true;
++  size_t max_body_size = 1024 * 1024;  // 1MB
++  
++  DataStorageConfig() = default;
++  ~DataStorageConfig() = default;
++};
++
++// Observer interface for storage events
++class DataStorageObserver {
++ public:
++  virtual ~DataStorageObserver() = default;
++  virtual void OnEventStored(const NetworkEvent& event) = 0;
++  virtual void OnEventsPersisted(size_t count) = 0;
++  virtual void OnStorageError(const std::string& error) = 0;
++  virtual void OnCleanupCompleted(size_t events_removed) = 0;
++};
++
++// Main data storage service coordinating all storage operations
++class DataStorageService : public EventStreamObserver {
++ public:
++  explicit DataStorageService(Profile* profile);
++  ~DataStorageService() override;
++
++  DataStorageService(const DataStorageService&) = delete;
++  DataStorageService& operator=(const DataStorageService&) = delete;
++
++  // Initialization and shutdown
++  void Initialize(const DataStorageConfig& config = DataStorageConfig());
++  void Shutdown();
++  bool IsInitialized() const { return initialized_; }
++  
++  // Event storage
++  void StoreEvent(std::unique_ptr<NetworkEvent> event);
++  void StoreEvents(std::vector<std::unique_ptr<NetworkEvent>> events);
++  
++  // Event retrieval
++  std::vector<std::unique_ptr<NetworkEvent>> GetRecentEvents(size_t count = 100);
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsSince(base::Time since);
++  std::vector<std::unique_ptr<NetworkEvent>> GetEventsFromStream(
++      const std::string& stream_name, size_t count = 100);
++  std::unique_ptr<NetworkEvent> GetEventById(const std::string& event_id);
++  
++  // Stream management
++  void CreateStream(const std::string& stream_name);
++  void DeleteStream(const std::string& stream_name);
++  std::vector<std::string> GetStreamNames();
++  StreamStatistics GetStreamStatistics(const std::string& stream_name);
++  
++  // Search and filtering
++  std::vector<std::unique_ptr<NetworkEvent>> SearchEvents(
++      const std::string& query, size_t max_results = 100);
++  std::vector<std::unique_ptr<NetworkEvent>> FilterEventsByUrl(
++      const std::string& url_pattern, size_t max_results = 100);
++  std::vector<std::unique_ptr<NetworkEvent>> FilterEventsByMethod(
++      const std::string& method, size_t max_results = 100);
++  std::vector<std::unique_ptr<NetworkEvent>> FilterEventsByStatusCode(
++      int status_code, size_t max_results = 100);
++  
++  // Analytics and statistics
++  struct StorageStatistics {
++    size_t total_events_stored = 0;
++    size_t memory_events_count = 0;
++    size_t persistent_events_count = 0;
++    size_t total_memory_usage_bytes = 0;
++    size_t database_size_bytes = 0;
++    size_t active_streams_count = 0;
++    base::Time oldest_event_time;
++    base::Time newest_event_time;
++    double avg_events_per_minute = 0.0;
++  };
++  
++  StorageStatistics GetStorageStatistics();
++  std::map<std::string, StreamStatistics> GetAllStreamStatistics();
++  
++  // Configuration management
++  void UpdateConfig(const DataStorageConfig& config);
++  const DataStorageConfig& GetConfig() const { return config_; }
++  
++  // Memory management
++  void TrimMemoryUsage();
++  void FlushToDisk();
++  void ClearMemoryBuffers();
++  
++  // Maintenance operations
++  void RunCleanup();
++  void OptimizeDatabase();
++  void ExportData(const base::FilePath& export_path, 
++                  const std::string& format = "json");
++  
++  // Observer management
++  void AddObserver(DataStorageObserver* observer);
++  void RemoveObserver(DataStorageObserver* observer);
++  
++  // EventStreamObserver implementation
++  void OnStreamCreated(const std::string& stream_name) override;
++  void OnStreamDestroyed(const std::string& stream_name) override;
++  void OnEventRouted(const std::string& stream_name, 
++                    const NetworkEvent& event) override;
++  void OnStreamStatisticsUpdated(const std::string& stream_name) override;
++  
++ private:
++  // Background task management
++  void ScheduleBackgroundTasks();
++  void OnFlushTimer();
++  void OnCleanupTimer();
++  void FlushPendingEventsToDisk();
++  
++  // Database operations
++  void InitializeDatabase();
++  void PersistEventToDatabase(const NetworkEvent& event);
++  void PersistEventBatchToDatabase(
++      const std::vector<std::unique_ptr<NetworkEvent>>& events);
++  
++  // Memory management helpers
++  void CheckMemoryLimits();
++  void EvictOldestEvents(size_t count);
++  
++  // Observer notifications
++  void NotifyEventStored(const NetworkEvent& event);
++  void NotifyEventsPersisted(size_t count);
++  void NotifyStorageError(const std::string& error);
++  void NotifyCleanupCompleted(size_t events_removed);
++  
++  SEQUENCE_CHECKER(sequence_checker_);
++  
++  raw_ptr<Profile> profile_;
++  bool initialized_ = false;
++  DataStorageConfig config_;
++  
++  // Storage components
++  std::unique_ptr<DataSipperDatabase> database_;
++  std::unique_ptr<EventStreamManager> stream_manager_;
++  std::unique_ptr<CircularEventBuffer> main_buffer_;
++  
++  // Background task management
++  std::unique_ptr<base::RepeatingTimer> flush_timer_;
++  std::unique_ptr<base::RepeatingTimer> cleanup_timer_;
++  scoped_refptr<base::SequencedTaskRunner> background_task_runner_;
++  
++  // Pending operations
++  std::vector<std::unique_ptr<NetworkEvent>> pending_database_inserts_;
++  
++  // Observers
++  std::vector<DataStorageObserver*> observers_;
++  
++  // Statistics
++  mutable StorageStatistics cached_statistics_;
++  base::Time last_statistics_update_;
++  
++  base::WeakPtrFactory<DataStorageService> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STORAGE_DATA_STORAGE_SERVICE_H_
+--- /dev/null
++++ b/components/datasipper/storage/data_storage_service.cc
+@@ -0,0 +1,458 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/storage/data_storage_service.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/datasipper/database/datasipper_database.h"
++#include "components/datasipper/storage/circular_event_buffer.h"
++#include "sql/database.h"
++
++namespace datasipper {
++
++DataStorageService::DataStorageService(Profile* profile) 
++    : profile_(profile) {
++  DCHECK(profile_);
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++DataStorageService::~DataStorageService() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Shutdown();
++}
++
++void DataStorageService::Initialize(const DataStorageConfig& config) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (initialized_) {
++    LOG(WARNING) << "DataStorageService already initialized";
++    return;
++  }
++  
++  config_ = config;
++  
++  LOG(INFO) << "Initializing DataStorageService";
++  LOG(INFO) << "  Memory buffer size: " << config_.memory_buffer_size;
++  LOG(INFO) << "  Persistence enabled: " << config_.enable_persistence;
++  LOG(INFO) << "  Retention days: " << config_.retention_days;
++  
++  // Initialize main memory buffer
++  main_buffer_ = std::make_unique<CircularEventBuffer>(config_.memory_buffer_size);
++  main_buffer_->AddObserver(this);
++  
++  // Initialize stream manager
++  stream_manager_ = std::make_unique<EventStreamManager>(
++      config_.default_stream_buffer_size);
++  stream_manager_->AddObserver(this);
++  
++  // Initialize database if persistence is enabled
++  if (config_.enable_persistence) {
++    InitializeDatabase();
++  }
++  
++  // Set up background task runner
++  background_task_runner_ = base::ThreadPool::CreateSequencedTaskRunner(
++      {base::MayBlock(), base::TaskPriority::BEST_EFFORT});
++  
++  // Schedule background tasks
++  ScheduleBackgroundTasks();
++  
++  initialized_ = true;
++  LOG(INFO) << "DataStorageService initialized successfully";
++}
++
++void DataStorageService::Shutdown() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return;
++  }
++  
++  LOG(INFO) << "Shutting down DataStorageService";
++  
++  // Stop background tasks
++  flush_timer_.reset();
++  cleanup_timer_.reset();
++  
++  // Flush any pending data
++  FlushToDisk();
++  
++  // Clean up components
++  if (main_buffer_) {
++    main_buffer_->RemoveObserver(this);
++    main_buffer_.reset();
++  }
++  
++  if (stream_manager_) {
++    stream_manager_->RemoveObserver(this);
++    stream_manager_.reset();
++  }
++  
++  database_.reset();
++  
++  initialized_ = false;
++  LOG(INFO) << "DataStorageService shutdown complete";
++}
++
++void DataStorageService::StoreEvent(std::unique_ptr<NetworkEvent> event) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_ || !event) {
++    return;
++  }
++  
++  // Add to main buffer
++  main_buffer_->AddEvent(std::move(event));
++  
++  // Check memory limits
++  CheckMemoryLimits();
++}
++
++void DataStorageService::StoreEvents(
++    std::vector<std::unique_ptr<NetworkEvent>> events) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return;
++  }
++  
++  for (auto& event : events) {
++    if (event) {
++      main_buffer_->AddEvent(std::move(event));
++    }
++  }
++  
++  CheckMemoryLimits();
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++DataStorageService::GetRecentEvents(size_t count) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return {};
++  }
++  
++  return main_buffer_->GetEvents(count);
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++DataStorageService::GetEventsSince(base::Time since) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return {};
++  }
++  
++  auto memory_events = main_buffer_->GetEventsSince(since);
++  
++  // TODO: Also query database for events before memory buffer time range
++  
++  return memory_events;
++}
++
++std::vector<std::unique_ptr<NetworkEvent>> 
++DataStorageService::GetEventsFromStream(const std::string& stream_name, 
++                                       size_t count) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return {};
++  }
++  
++  return stream_manager_->GetEventsFromStream(stream_name, count);
++}
++
++std::unique_ptr<NetworkEvent> 
++DataStorageService::GetEventById(const std::string& event_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return nullptr;
++  }
++  
++  // First check memory buffer
++  auto event = main_buffer_->GetEvent(event_id);
++  if (event) {
++    return event;
++  }
++  
++  // TODO: Query database if not found in memory
++  
++  return nullptr;
++}
++
++void DataStorageService::CreateStream(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return;
++  }
++  
++  stream_manager_->CreateStream(stream_name, config_.default_stream_buffer_size);
++}
++
++void DataStorageService::DeleteStream(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return;
++  }
++  
++  stream_manager_->DestroyStream(stream_name);
++}
++
++std::vector<std::string> DataStorageService::GetStreamNames() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return {};
++  }
++  
++  return stream_manager_->GetStreamNames();
++}
++
++StreamStatistics DataStorageService::GetStreamStatistics(
++    const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return StreamStatistics();
++  }
++  
++  return stream_manager_->GetStreamStatistics(stream_name);
++}
++
++DataStorageService::StorageStatistics 
++DataStorageService::GetStorageStatistics() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return StorageStatistics();
++  }
++  
++  // Update cached statistics if needed
++  base::Time now = base::Time::Now();
++  if (now - last_statistics_update_ > base::Seconds(5)) {
++    cached_statistics_.memory_events_count = main_buffer_->GetSize();
++    cached_statistics_.total_memory_usage_bytes = stream_manager_->GetTotalMemoryUsage();
++    cached_statistics_.active_streams_count = stream_manager_->GetStreamNames().size();
++    cached_statistics_.oldest_event_time = main_buffer_->GetOldestEventTime();
++    cached_statistics_.newest_event_time = main_buffer_->GetNewestEventTime();
++    
++    // Calculate events per minute
++    if (!cached_statistics_.oldest_event_time.is_null() && 
++        !cached_statistics_.newest_event_time.is_null()) {
++      base::TimeDelta time_span = 
++          cached_statistics_.newest_event_time - cached_statistics_.oldest_event_time;
++      if (time_span.InMinutes() > 0) {
++        cached_statistics_.avg_events_per_minute = 
++            static_cast<double>(cached_statistics_.memory_events_count) / 
++            time_span.InMinutes();
++      }
++    }
++    
++    last_statistics_update_ = now;
++  }
++  
++  return cached_statistics_;
++}
++
++std::map<std::string, StreamStatistics> 
++DataStorageService::GetAllStreamStatistics() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_) {
++    return {};
++  }
++  
++  return stream_manager_->GetAllStreamStatistics();
++}
++
++void DataStorageService::FlushToDisk() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_ || !config_.enable_persistence) {
++    return;
++  }
++  
++  FlushPendingEventsToDisk();
++}
++
++void DataStorageService::InitializeDatabase() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  base::FilePath database_path = profile_->GetPath().Append(
++      FILE_PATH_LITERAL("DataSipper"));
++  
++  database_ = std::make_unique<DataSipperDatabase>(database_path);
++  
++  // Initialize on background thread
++  background_task_runner_->PostTask(
++      FROM_HERE,
++      base::BindOnce([](DataSipperDatabase* db) {
++        if (!db->Initialize()) {
++          LOG(ERROR) << "Failed to initialize DataSipper database";
++        }
++      }, database_.get()));
++}
++
++void DataStorageService::ScheduleBackgroundTasks() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // Set up flush timer
++  flush_timer_ = std::make_unique<base::RepeatingTimer>();
++  flush_timer_->Start(
++      FROM_HERE, 
++      config_.flush_interval,
++      base::BindRepeating(&DataStorageService::OnFlushTimer, 
++                         weak_factory_.GetWeakPtr()));
++  
++  // Set up cleanup timer
++  cleanup_timer_ = std::make_unique<base::RepeatingTimer>();
++  cleanup_timer_->Start(
++      FROM_HERE,
++      config_.cleanup_interval,
++      base::BindRepeating(&DataStorageService::OnCleanupTimer,
++                         weak_factory_.GetWeakPtr()));
++}
++
++void DataStorageService::OnFlushTimer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  FlushToDisk();
++}
++
++void DataStorageService::OnCleanupTimer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  RunCleanup();
++}
++
++void DataStorageService::CheckMemoryLimits() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  size_t current_usage = stream_manager_->GetTotalMemoryUsage();
++  size_t limit_bytes = config_.max_memory_usage_mb * 1024 * 1024;
++  
++  if (current_usage > limit_bytes) {
++    LOG(INFO) << "Memory usage (" << current_usage / 1024 / 1024 
++              << "MB) exceeds limit (" << config_.max_memory_usage_mb 
++              << "MB), trimming buffers";
++    
++    TrimMemoryUsage();
++  }
++}
++
++void DataStorageService::TrimMemoryUsage() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // Calculate target size (80% of limit)
++  size_t target_total_bytes = config_.max_memory_usage_mb * 1024 * 1024 * 0.8;
++  size_t current_usage = stream_manager_->GetTotalMemoryUsage();
++  
++  if (current_usage <= target_total_bytes) {
++    return;
++  }
++  
++  // Trim all streams proportionally
++  auto stream_names = stream_manager_->GetStreamNames();
++  if (!stream_names.empty()) {
++    size_t target_per_stream = target_total_bytes / stream_names.size();
++    stream_manager_->TrimAllStreams(target_per_stream);
++  }
++  
++  LOG(INFO) << "Memory trimmed from " << current_usage / 1024 / 1024 
++            << "MB to approximately " << target_total_bytes / 1024 / 1024 << "MB";
++}
++
++void DataStorageService::RunCleanup() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!initialized_ || !config_.enable_persistence || !database_) {
++    return;
++  }
++  
++  LOG(INFO) << "Running data cleanup (retention: " << config_.retention_days << " days)";
++  
++  // Run cleanup on background thread
++  background_task_runner_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce([](DataSipperDatabase* db, int retention_days) -> size_t {
++        return db->CleanupOldData(retention_days);
++      }, database_.get(), config_.retention_days),
++      base::BindOnce([](base::WeakPtr<DataStorageService> service, size_t removed_count) {
++        if (service) {
++          service->NotifyCleanupCompleted(removed_count);
++        }
++      }, weak_factory_.GetWeakPtr()));
++}
++
++void DataStorageService::FlushPendingEventsToDisk() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (pending_database_inserts_.empty() || !database_) {
++    return;
++  }
++  
++  // Move pending events to background thread for processing
++  auto events_to_persist = std::move(pending_database_inserts_);
++  pending_database_inserts_.clear();
++  
++  size_t event_count = events_to_persist.size();
++  
++  background_task_runner_->PostTaskAndReply(
++      FROM_HERE,
++      base::BindOnce([](DataSipperDatabase* db, 
++                       std::vector<std::unique_ptr<NetworkEvent>> events) {
++        for (auto& event : events) {
++          db->StoreNetworkEvent(*event);
++        }
++      }, database_.get(), std::move(events_to_persist)),
++      base::BindOnce([](base::WeakPtr<DataStorageService> service, size_t count) {
++        if (service) {
++          service->NotifyEventsPersisted(count);
++        }
++      }, weak_factory_.GetWeakPtr(), event_count));
++}
++
++// EventStreamObserver implementation
++void DataStorageService::OnStreamCreated(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  LOG(INFO) << "Stream created: " << stream_name;
++}
++
++void DataStorageService::OnStreamDestroyed(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  LOG(INFO) << "Stream destroyed: " << stream_name;
++}
++
++void DataStorageService::OnEventRouted(const std::string& stream_name, 
++                                      const NetworkEvent& event) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // Add to pending database inserts if persistence is enabled
++  if (config_.enable_persistence) {
++    auto event_copy = std::make_unique<NetworkEvent>();
++    *event_copy = event;  // Copy the event
++    pending_database_inserts_.push_back(std::move(event_copy));
++    
++    // Flush if batch size reached
++    if (pending_database_inserts_.size() >= config_.batch_insert_size) {
++      FlushPendingEventsToDisk();
++    }
++  }
++  
++  NotifyEventStored(event);
++}
++
++void DataStorageService::OnStreamStatisticsUpdated(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Statistics updated - invalidate cache
++  last_statistics_update_ = base::Time();
++}
++
++void DataStorageService::AddObserver(DataStorageObserver* observer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  observers_.push_back(observer);
++}
++
++void DataStorageService::RemoveObserver(DataStorageObserver* observer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto it = std::find(observers_.begin(), observers_.end(), observer);
++  if (it != observers_.end()) {
++    observers_.erase(it);
++  }
++}
++
++void DataStorageService::NotifyEventStored(const NetworkEvent& event) {
++  for (auto* observer : observers_) {
++    observer->OnEventStored(event);
++  }
++}
++
++void DataStorageService::NotifyEventsPersisted(size_t count) {
++  for (auto* observer : observers_) {
++    observer->OnEventsPersisted(count);
++  }
++}
++
++void DataStorageService::NotifyStorageError(const std::string& error) {
++  for (auto* observer : observers_) {
++    observer->OnStorageError(error);
++  }
++}
++
++void DataStorageService::NotifyCleanupCompleted(size_t events_removed) {
++  LOG(INFO) << "Cleanup completed: " << events_removed << " events removed";
++  for (auto* observer : observers_) {
++    observer->OnCleanupCompleted(events_removed);
++  }
++}
++
++}  // namespace datasipper

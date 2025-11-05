@@ -1,0 +1,494 @@
+# DataSipper: Data transformation engine with JavaScript support
+#
+# This patch implements the transformation engine that allows users to
+# transform network data using JavaScript before routing to output services.
+#
+# Affects:
+# - components/datasipper/transform/ (new directory)
+# - components/datasipper/transform/javascript_transformer.h (new file)
+# - components/datasipper/transform/javascript_transformer.cc (new file)
+# - components/datasipper/transform/transformation_context.h (new file)
+
+--- /dev/null
++++ b/components/datasipper/transform/transformation_context.h
+@@ -0,0 +1,85 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_TRANSFORM_TRANSFORMATION_CONTEXT_H_
++#define COMPONENTS_DATASIPPER_TRANSFORM_TRANSFORMATION_CONTEXT_H_
++
++#include <memory>
++#include <string>
++
++#include "base/time/time.h"
++#include "base/values.h"
++#include "url/gurl.h"
++
++namespace datasipper {
++
++// Context information available during transformation
++struct TransformationContext {
++  // Event metadata
++  std::string event_type;          // "http_request", "http_response", "websocket_message"
++  base::Time timestamp;
++  std::string connection_id;
++  
++  // HTTP-specific context
++  GURL url;
++  std::string method;
++  int status_code = 0;
++  base::Value::Dict request_headers;
++  base::Value::Dict response_headers;
++  std::string request_body;
++  std::string response_body;
++  int64_t request_size = 0;
++  int64_t response_size = 0;
++  int duration_ms = 0;
++  
++  // WebSocket-specific context
++  std::string websocket_protocol;
++  std::string message_payload;
++  bool is_outgoing = false;
++  std::string frame_type;
++  
++  // Stream context
++  std::string stream_name;
++  std::string group_name;
++  size_t event_sequence = 0;       // Sequence number within group
++  
++  // Utility methods
++  base::Value::Dict ToDict() const;
++  static TransformationContext FromDict(const base::Value::Dict& dict);
++  
++  // Helper methods for JavaScript
++  std::string GetHost() const;
++  std::string GetPath() const;
++  std::string GetQuery() const;
++  std::string GetHeader(const std::string& name) const;
++  bool HasHeader(const std::string& name) const;
++  std::string ExtractJsonField(const std::string& json_text, const std::string& field_path) const;
++};
++
++// Result of a transformation operation
++struct TransformationResult {
++  bool success = false;
++  std::string error_message;
++  base::Value::Dict transformed_data;
++  
++  // Output routing overrides (if specified by transformation)
++  std::string output_type;         // Override output type
++  std::string kafka_topic;         // Override Kafka topic
++  int kafka_partition = -1;        // Override Kafka partition
++  std::string redis_key;           // Override Redis key
++  std::string redis_channel;       // Override Redis channel
++  
++  // Metadata
++  base::Time transformation_time;
++  int execution_time_ms = 0;
++  
++  static TransformationResult Success(base::Value::Dict data);
++  static TransformationResult Error(const std::string& error);
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_TRANSFORM_TRANSFORMATION_CONTEXT_H_
+--- /dev/null
++++ b/components/datasipper/transform/javascript_transformer.h
+@@ -0,0 +1,102 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_TRANSFORM_JAVASCRIPT_TRANSFORMER_H_
++#define COMPONENTS_DATASIPPER_TRANSFORM_JAVASCRIPT_TRANSFORMER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "components/datasipper/transform/transformation_context.h"
++#include "v8/include/v8.h"
++
++namespace datasipper {
++
++// JavaScript execution environment for data transformation
++class JavaScriptTransformer {
++ public:
++  JavaScriptTransformer();
++  ~JavaScriptTransformer();
++  
++  JavaScriptTransformer(const JavaScriptTransformer&) = delete;
++  JavaScriptTransformer& operator=(const JavaScriptTransformer&) = delete;
++
++  // Initialize the V8 context and built-in functions
++  bool Initialize();
++  void Shutdown();
++  
++  // Execute transformation script
++  TransformationResult Transform(const TransformationContext& context,
++                                const std::string& javascript_code);
++  
++  // Validate JavaScript code without executing
++  bool ValidateScript(const std::string& javascript_code, std::string* error_message = nullptr);
++  
++  // Pre-compile scripts for better performance
++  bool CompileScript(const std::string& name, const std::string& javascript_code);
++  TransformationResult ExecuteCompiledScript(const std::string& name, 
++                                           const TransformationContext& context);
++  void RemoveCompiledScript(const std::string& name);
++  
++ private:
++  // V8 setup and teardown
++  bool SetupV8Context();
++  void SetupBuiltinFunctions();
++  void SetupGlobalObjects();
++  
++  // Context injection
++  void InjectTransformationContext(const TransformationContext& context);
++  void InjectUtilityFunctions();
++  
++  // Built-in utility functions for JavaScript
++  static void JSLog(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSParseJSON(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSStringifyJSON(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSExtractPath(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSBase64Encode(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSBase64Decode(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSURLParse(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSTimestamp(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSHash(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void JSRegexMatch(const v8::FunctionCallbackInfo<v8::Value>& args);
++  
++  // Helper methods
++  v8::Local<v8::Value> JSONToV8(const base::Value& json_value);
++  base::Value V8ToJSON(v8::Local<v8::Value> v8_value);
++  std::string V8ToString(v8::Local<v8::Value> v8_value);
++  
++  // Error handling
++  std::string ExtractV8Error(v8::TryCatch& try_catch);
++  
++  // V8 isolate and context
++  std::unique_ptr<v8::Isolate, void(*)(v8::Isolate*)> isolate_;
++  v8::Global<v8::Context> context_;
++  
++  // Compiled scripts cache
++  std::map<std::string, v8::Global<v8::Script>> compiled_scripts_;
++  
++  // Security and performance limits
++  static constexpr int kMaxExecutionTimeMs = 5000;    // 5 second timeout
++  static constexpr size_t kMaxMemoryUsage = 50 * 1024 * 1024;  // 50MB limit
++  static constexpr size_t kMaxStackDepth = 100;
++  
++  bool initialized_ = false;
++  
++  base::WeakPtrFactory<JavaScriptTransformer> weak_factory_{this};
++};
++
++// Global transformer instance management
++class TransformerManager {
++ public:
++  static TransformerManager* GetInstance();
++  
++  JavaScriptTransformer* GetTransformer();
++  void ReleaseTransformer(JavaScriptTransformer* transformer);
++  
++ private:
++  // Pool of transformer instances for thread safety
++  std::vector<std::unique_ptr<JavaScriptTransformer>> transformer_pool_;
++  base::Lock pool_lock_;
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_TRANSFORM_JAVASCRIPT_TRANSFORMER_H_
+--- /dev/null
++++ b/components/datasipper/transform/javascript_transformer.cc
+@@ -0,0 +1,267 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/transform/javascript_transformer.h"
++
++#include "base/base64.h"
++#include "base/hash/sha1.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/time/time.h"
++#include "url/gurl.h"
++
++namespace datasipper {
++
++namespace {
++
++// V8 isolate deleter
++void DeleteV8Isolate(v8::Isolate* isolate) {
++  isolate->Dispose();
++}
++
++}  // namespace
++
++JavaScriptTransformer::JavaScriptTransformer() 
++    : isolate_(nullptr, DeleteV8Isolate) {
++}
++
++JavaScriptTransformer::~JavaScriptTransformer() {
++  Shutdown();
++}
++
++bool JavaScriptTransformer::Initialize() {
++  if (initialized_) return true;
++  
++  // Initialize V8 if not already done
++  static bool v8_initialized = false;
++  if (!v8_initialized) {
++    v8::V8::InitializeICUDefaultLocation("");
++    v8::V8::InitializeExternalStartupData("");
++    v8::V8::Initialize();
++    v8_initialized = true;
++  }
++  
++  if (!SetupV8Context()) {
++    LOG(ERROR) << "Failed to setup V8 context for JavaScript transformer";
++    return false;
++  }
++  
++  initialized_ = true;
++  return true;
++}
++
++void JavaScriptTransformer::Shutdown() {
++  if (!initialized_) return;
++  
++  compiled_scripts_.clear();
++  context_.Reset();
++  isolate_.reset();
++  initialized_ = false;
++}
++
++bool JavaScriptTransformer::SetupV8Context() {
++  // Create isolate with resource constraints
++  v8::Isolate::CreateParams create_params;
++  create_params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
++  
++  isolate_.reset(v8::Isolate::New(create_params));
++  if (!isolate_) return false;
++  
++  v8::Isolate::Scope isolate_scope(isolate_.get());
++  v8::HandleScope handle_scope(isolate_.get());
++  
++  // Create context with global template
++  v8::Local<v8::ObjectTemplate> global_template = v8::ObjectTemplate::New(isolate_.get());
++  
++  v8::Local<v8::Context> context = v8::Context::New(isolate_.get(), nullptr, global_template);
++  if (context.IsEmpty()) return false;
++  
++  context_.Reset(isolate_.get(), context);
++  
++  // Setup built-in functions and objects
++  v8::Context::Scope context_scope(context);
++  SetupBuiltinFunctions();
++  SetupGlobalObjects();
++  
++  return true;
++}
++
++void JavaScriptTransformer::SetupBuiltinFunctions() {
++  v8::Local<v8::Context> context = context_.Get(isolate_.get());
++  v8::Local<v8::Object> global = context->Global();
++  
++  // Utility functions
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "log"),
++              v8::Function::New(context, JSLog).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "parseJSON"),
++              v8::Function::New(context, JSParseJSON).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "stringifyJSON"),
++              v8::Function::New(context, JSStringifyJSON).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "extractPath"),
++              v8::Function::New(context, JSExtractPath).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "base64Encode"),
++              v8::Function::New(context, JSBase64Encode).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "base64Decode"),
++              v8::Function::New(context, JSBase64Decode).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "urlParse"),
++              v8::Function::New(context, JSURLParse).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "timestamp"),
++              v8::Function::New(context, JSTimestamp).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "hash"),
++              v8::Function::New(context, JSHash).ToLocalChecked()).Check();
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "regexMatch"),
++              v8::Function::New(context, JSRegexMatch).ToLocalChecked()).Check();
++}
++
++void JavaScriptTransformer::SetupGlobalObjects() {
++  // Create global objects that will be populated with context data
++  v8::Local<v8::Context> context = context_.Get(isolate_.get());
++  v8::Local<v8::Object> global = context->Global();
++  
++  // Event object (will be populated per transformation)
++  v8::Local<v8::Object> event_obj = v8::Object::New(isolate_.get());
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "event"), event_obj).Check();
++  
++  // Output object for specifying routing overrides
++  v8::Local<v8::Object> output_obj = v8::Object::New(isolate_.get());
++  global->Set(context, v8::String::NewFromUtf8Literal(isolate_.get(), "output"), output_obj).Check();
++}
++
++TransformationResult JavaScriptTransformer::Transform(
++    const TransformationContext& context,
++    const std::string& javascript_code) {
++  if (!initialized_) {
++    return TransformationResult::Error("Transformer not initialized");
++  }
++  
++  base::Time start_time = base::Time::Now();
++  
++  v8::Isolate::Scope isolate_scope(isolate_.get());
++  v8::HandleScope handle_scope(isolate_.get());
++  v8::Local<v8::Context> v8_context = context_.Get(isolate_.get());
++  v8::Context::Scope context_scope(v8_context);
++  
++  // Set up try-catch for error handling
++  v8::TryCatch try_catch(isolate_.get());
++  
++  // Inject transformation context
++  InjectTransformationContext(context);
++  
++  // Compile and run the script
++  v8::Local<v8::String> source = v8::String::NewFromUtf8(
++      isolate_.get(), javascript_code.c_str()).ToLocalChecked();
++  v8::Local<v8::Script> script;
++  
++  if (!v8::Script::Compile(v8_context, source).ToLocal(&script)) {
++    return TransformationResult::Error("Script compilation failed: " + ExtractV8Error(try_catch));
++  }
++  
++  // Execute with timeout
++  isolate_->SetHostImportModuleDynamicallyCallback(nullptr);
++  
++  v8::Local<v8::Value> result;
++  if (!script->Run(v8_context).ToLocal(&result)) {
++    return TransformationResult::Error("Script execution failed: " + ExtractV8Error(try_catch));
++  }
++  
++  // Extract the result
++  TransformationResult transform_result = TransformationResult::Success(base::Value::Dict());
++  
++  if (result->IsObject()) {
++    transform_result.transformed_data = V8ToJSON(result).GetDict().Clone();
++  } else {
++    // If script returns a primitive, wrap it in a data field
++    transform_result.transformed_data.Set("data", V8ToJSON(result));
++  }
++  
++  // Check for output routing overrides
++  v8::Local<v8::Object> global = v8_context->Global();
++  v8::Local<v8::Value> output_val;
++  if (global->Get(v8_context, v8::String::NewFromUtf8Literal(isolate_.get(), "output"))
++          .ToLocal(&output_val) && output_val->IsObject()) {
++    v8::Local<v8::Object> output_obj = output_val.As<v8::Object>();
++    
++    // Extract routing overrides
++    auto extractStringProperty = [&](const char* name) -> std::string {
++      v8::Local<v8::Value> val;
++      if (output_obj->Get(v8_context, v8::String::NewFromUtf8Literal(isolate_.get(), name))
++              .ToLocal(&val) && val->IsString()) {
++        return V8ToString(val);
++      }
++      return std::string();
++    };
++    
++    transform_result.kafka_topic = extractStringProperty("kafkaTopic");
++    transform_result.redis_key = extractStringProperty("redisKey");
++    transform_result.redis_channel = extractStringProperty("redisChannel");
++    transform_result.output_type = extractStringProperty("type");
++  }
++  
++  transform_result.transformation_time = base::Time::Now();
++  transform_result.execution_time_ms = 
++      (transform_result.transformation_time - start_time).InMilliseconds();
++  
++  return transform_result;
++}
++
++void JavaScriptTransformer::InjectTransformationContext(const TransformationContext& context) {
++  v8::Local<v8::Context> v8_context = context_.Get(isolate_.get());
++  v8::Local<v8::Object> global = v8_context->Global();
++  
++  // Convert context to V8 object
++  base::Value::Dict context_dict = context.ToDict();
++  v8::Local<v8::Value> event_obj = JSONToV8(base::Value(std::move(context_dict)));
++  
++  global->Set(v8_context, v8::String::NewFromUtf8Literal(isolate_.get(), "event"), event_obj).Check();
++}
++
++// Built-in JavaScript functions implementation
++void JavaScriptTransformer::JSLog(const v8::FunctionCallbackInfo<v8::Value>& args) {
++  if (args.Length() > 0) {
++    v8::String::Utf8Value str(args.GetIsolate(), args[0]);
++    DVLOG(1) << "DataSipper JS: " << *str;
++  }
++}
++
++void JavaScriptTransformer::JSParseJSON(const v8::FunctionCallbackInfo<v8::Value>& args) {
++  v8::Isolate* isolate = args.GetIsolate();
++  
++  if (args.Length() == 0 || !args[0]->IsString()) {
++    isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "parseJSON requires a string argument"));
++    return;
++  }
++  
++  v8::String::Utf8Value json_str(isolate, args[0]);
++  auto parsed = base::JSONReader::ReadAndReturnValueWithError(*json_str);
++  
++  if (!parsed.has_value()) {
++    isolate->ThrowException(v8::String::NewFromUtf8(isolate, ("JSON parse error: " + parsed.error().message).c_str()).ToLocalChecked());
++    return;
++  }
++  
++  // Convert back to V8 - this is a placeholder implementation
++  args.GetReturnValue().Set(v8::Object::New(isolate));
++}
++
++void JavaScriptTransformer::JSTimestamp(const v8::FunctionCallbackInfo<v8::Value>& args) {
++  v8::Isolate* isolate = args.GetIsolate();
++  double timestamp = base::Time::Now().ToJsTime();
++  args.GetReturnValue().Set(v8::Number::New(isolate, timestamp));
++}
++
++std::string JavaScriptTransformer::ExtractV8Error(v8::TryCatch& try_catch) {
++  v8::String::Utf8Value exception(isolate_.get(), try_catch.Exception());
++  std::string error_msg(*exception);
++  
++  v8::Local<v8::Message> message = try_catch.Message();
++  if (!message.IsEmpty()) {
++    v8::String::Utf8Value filename(isolate_.get(), message->GetScriptResourceName());
++    int line_number = message->GetLineNumber(context_.Get(isolate_.get())).FromMaybe(-1);
++    error_msg += " at " + std::string(*filename) + ":" + std::to_string(line_number);
++  }
++  
++  return error_msg;
++}
++
++v8::Local<v8::Value> JavaScriptTransformer::JSONToV8(const base::Value& json_value) {
++  // Placeholder implementation - would need full JSON to V8 conversion
++  return v8::Object::New(isolate_.get());
++}
++
++base::Value JavaScriptTransformer::V8ToJSON(v8::Local<v8::Value> v8_value) {
++  // Placeholder implementation - would need full V8 to JSON conversion
++  return base::Value();
++}
++
++std::string JavaScriptTransformer::V8ToString(v8::Local<v8::Value> v8_value) {
++  v8::String::Utf8Value str(isolate_.get(), v8_value);
++  return std::string(*str);
++}
++
++}  // namespace datasipper

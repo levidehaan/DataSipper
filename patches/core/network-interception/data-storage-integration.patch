@@ -1,0 +1,308 @@
+# DataSipper: Data storage integration for network events
+#
+# This patch connects the network interception to the data storage system,
+# enabling captured events to be stored and retrieved efficiently.
+#
+# Affects:
+# - chrome/browser/datasipper/datasipper_service_factory.h/cc (new files)
+# - content/browser/datasipper/ (new directory)
+
+--- /dev/null
++++ b/chrome/browser/datasipper/datasipper_service_factory.h
+@@ -0,0 +1,43 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_DATASIPPER_DATASIPPER_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_DATASIPPER_DATASIPPER_SERVICE_FACTORY_H_
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace datasipper {
++class DataSipperService;
++}
++
++// Factory for creating DataSipperService instances per profile
++class DataSipperServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static DataSipperServiceFactory* GetInstance();
++  static datasipper::DataSipperService* GetForProfile(Profile* profile);
++
++  DataSipperServiceFactory(const DataSipperServiceFactory&) = delete;
++  DataSipperServiceFactory& operator=(const DataSipperServiceFactory&) = delete;
++
++ private:
++  friend class base::NoDestructor<DataSipperServiceFactory>;
++
++  DataSipperServiceFactory();
++  ~DataSipperServiceFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++#endif  // CHROME_BROWSER_DATASIPPER_DATASIPPER_SERVICE_FACTORY_H_
+--- /dev/null
++++ b/chrome/browser/datasipper/datasipper_service_factory.cc
+@@ -0,0 +1,52 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/datasipper/datasipper_service_factory.h"
++
++#include "chrome/browser/datasipper/datasipper_service.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_features.h"
++#include "components/keyed_service/content/browser_context_dependency_manager.h"
++
++// static
++DataSipperServiceFactory* DataSipperServiceFactory::GetInstance() {
++  static base::NoDestructor<DataSipperServiceFactory> instance;
++  return instance.get();
++}
++
++// static
++datasipper::DataSipperService* DataSipperServiceFactory::GetForProfile(
++    Profile* profile) {
++  if (!base::FeatureList::IsEnabled(features::kDataSipperEnabled)) {
++    return nullptr;
++  }
++  
++  return static_cast<datasipper::DataSipperService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++DataSipperServiceFactory::DataSipperServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "DataSipperService",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kNone)
++              .Build()) {
++}
++
++DataSipperServiceFactory::~DataSipperServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++DataSipperServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<datasipper::DataSipperService>(profile);
++}
++
++bool DataSipperServiceFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++bool DataSipperServiceFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
+--- /dev/null
++++ b/content/browser/datasipper/datasipper_network_service_observer.h
+@@ -0,0 +1,58 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_DATASIPPER_DATASIPPER_NETWORK_SERVICE_OBSERVER_H_
++#define CONTENT_BROWSER_DATASIPPER_DATASIPPER_NETWORK_SERVICE_OBSERVER_H_
++
++#include "base/memory/weak_ptr.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "services/network/public/mojom/network_service.mojom.h"
++
++namespace content {
++class BrowserContext;
++}
++
++namespace datasipper {
++class DataSipperService;
++struct NetworkEvent;
++}
++
++namespace content {
++
++// Bridge between network service and DataSipper service in browser process
++class DataSipperNetworkServiceObserver 
++    : public network::mojom::NetworkServiceObserver {
++ public:
++  explicit DataSipperNetworkServiceObserver(BrowserContext* browser_context);
++  ~DataSipperNetworkServiceObserver() override;
++
++  DataSipperNetworkServiceObserver(const DataSipperNetworkServiceObserver&) = delete;
++  DataSipperNetworkServiceObserver& operator=(const DataSipperNetworkServiceObserver&) = delete;
++
++  // network::mojom::NetworkServiceObserver implementation:
++  void OnDataSipperNetworkEvent(
++      const std::string& event_data) override;
++
++  // Setup and teardown
++  void Initialize();
++  void Shutdown();
++
++ private:
++  void OnNetworkEventReceived(std::unique_ptr<datasipper::NetworkEvent> event);
++  datasipper::DataSipperService* GetDataSipperService();
++  
++  raw_ptr<BrowserContext> browser_context_;
++  mojo::Receiver<network::mojom::NetworkServiceObserver> receiver_{this};
++  
++  base::WeakPtrFactory<DataSipperNetworkServiceObserver> weak_factory_{this};
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_DATASIPPER_DATASIPPER_NETWORK_SERVICE_OBSERVER_H_
+--- /dev/null
++++ b/content/browser/datasipper/datasipper_network_service_observer.cc
+@@ -0,0 +1,78 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/datasipper/datasipper_network_service_observer.h"
++
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "chrome/browser/datasipper/datasipper_service.h"
++#include "chrome/browser/datasipper/datasipper_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/datasipper/common/network_event.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition.h"
++
++namespace content {
++
++DataSipperNetworkServiceObserver::DataSipperNetworkServiceObserver(
++    BrowserContext* browser_context)
++    : browser_context_(browser_context) {
++  DCHECK(browser_context_);
++}
++
++DataSipperNetworkServiceObserver::~DataSipperNetworkServiceObserver() = default;
++
++void DataSipperNetworkServiceObserver::Initialize() {
++  // Connect to network service as observer
++  auto* storage_partition = browser_context_->GetDefaultStoragePartition();
++  if (storage_partition && storage_partition->GetNetworkContext()) {
++    storage_partition->GetNetworkContext()->AddNetworkServiceObserver(
++        receiver_.BindNewPipeAndPassRemote());
++  }
++  
++  LOG(INFO) << "DataSipper network service observer initialized";
++}
++
++void DataSipperNetworkServiceObserver::Shutdown() {
++  receiver_.reset();
++  LOG(INFO) << "DataSipper network service observer shutdown";
++}
++
++void DataSipperNetworkServiceObserver::OnDataSipperNetworkEvent(
++    const std::string& event_data) {
++  // Parse JSON event data
++  auto parsed_json = base::JSONReader::ReadAndReturnValueWithError(event_data);
++  if (!parsed_json.has_value() || !parsed_json->is_dict()) {
++    LOG(ERROR) << "Failed to parse DataSipper network event JSON";
++    return;
++  }
++  
++  // Convert to NetworkEvent
++  auto event = datasipper::NetworkEvent::FromDict(parsed_json->GetDict());
++  if (!event) {
++    LOG(ERROR) << "Failed to create NetworkEvent from JSON data";
++    return;
++  }
++  
++  OnNetworkEventReceived(std::move(event));
++}
++
++void DataSipperNetworkServiceObserver::OnNetworkEventReceived(
++    std::unique_ptr<datasipper::NetworkEvent> event) {
++  auto* service = GetDataSipperService();
++  if (service) {
++    service->OnNetworkEvent(std::move(event));
++  } else {
++    DVLOG(1) << "DataSipper service not available, dropping network event";
++  }
++}
++
++datasipper::DataSipperService* 
++DataSipperNetworkServiceObserver::GetDataSipperService() {
++  Profile* profile = Profile::FromBrowserContext(browser_context_);
++  return profile ? DataSipperServiceFactory::GetForProfile(profile) : nullptr;
++}
++
++}  // namespace content
+--- a/services/network/datasipper_network_observer.cc
++++ b/services/network/datasipper_network_observer.cc
+@@ -160,7 +160,16 @@ void DataSipperNetworkObserver::OnRequestFailed(
+ 
+ void DataSipperNetworkObserver::SendNetworkEvent(
+     std::unique_ptr<datasipper::NetworkEvent> event) {
+-  // TODO: Send event to DataSipper service
+-  // This will be implemented when the service communication is available
++  // Convert event to JSON and send via Mojo
++  base::Value::Dict event_dict = event->ToDict();
++  std::string json_string;
++  base::JSONWriter::Write(event_dict, &json_string);
++  
++  // Send to browser process via network service observer interface
++  // TODO: Implement Mojo interface for sending events to browser process
++  // For now, just log the event
+   DVLOG(1) << "DataSipper: Event captured for " << event->url.spec();
++  DVLOG(3) << "DataSipper: Event JSON: " << json_string;
++  
++  // The actual Mojo call will be implemented when the interface is ready
+ }
+--- a/chrome/browser/datasipper/BUILD.gn
++++ b/chrome/browser/datasipper/BUILD.gn
+@@ -9,6 +9,8 @@ source_set("datasipper") {
+   sources = [
+     "datasipper_service.cc",
+     "datasipper_service.h",
++    "datasipper_service_factory.cc",
++    "datasipper_service_factory.h",
+   ]
+ 
+   deps = [
+@@ -16,6 +18,7 @@ source_set("datasipper") {
+     "//chrome/browser/profiles",
+     "//components/datasipper",
+     "//components/keyed_service/core",
++    "//content/public/browser",
+   ]
+ 
+   # Only include in builds where DataSipper is enabled
+--- /dev/null
++++ b/content/browser/datasipper/BUILD.gn
+@@ -0,0 +1,22 @@
++# Copyright 2024 The DataSipper Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/features.gni")
++
++# DataSipper content browser integration
++source_set("datasipper") {
++  sources = [
++    "datasipper_network_service_observer.cc",
++    "datasipper_network_service_observer.h",
++  ]
++
++  deps = [
++    "//base",
++    "//chrome/browser/datasipper",
++    "//components/datasipper",
++    "//content/public/browser",
++    "//mojo/public/cpp/bindings",
++    "//services/network/public/mojom",
++  ]
++}

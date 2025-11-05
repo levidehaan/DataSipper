@@ -1,0 +1,402 @@
+# DataSipper: WebSocket message interception
+#
+# This patch implements WebSocket message capture by hooking into
+# the WebSocket channel implementation to log all bidirectional messages.
+#
+# Affects:
+# - net/websockets/websocket_channel.cc
+# - net/websockets/websocket_channel.h
+# - content/browser/renderer_host/render_frame_host_impl.cc
+
+--- a/net/websockets/websocket_channel.h
++++ b/net/websockets/websocket_channel.h
+@@ -33,6 +33,7 @@
+ #include "net/websockets/websocket_event_interface.h"
+ #include "net/websockets/websocket_frame.h"
+ #include "net/websockets/websocket_stream.h"
++#include "net/websockets/datasipper_websocket_observer.h"
+ #include "url/gurl.h"
+ #include "url/origin.h"
+ 
+@@ -296,6 +297,9 @@ class NET_EXPORT WebSocketChannel {
+   // The current state of the channel. Mainly used for sanity checking.
+   State state_;
+ 
++  // DataSipper observer for capturing WebSocket messages
++  std::unique_ptr<DataSipperWebSocketObserver> datasipper_observer_;
++
+   DISALLOW_COPY_AND_ASSIGN(WebSocketChannel);
+ };
+ 
+--- a/net/websockets/websocket_channel.cc
++++ b/net/websockets/websocket_channel.cc
+@@ -30,6 +30,7 @@
+ #include "net/websockets/websocket_errors.h"
+ #include "net/websockets/websocket_event_interface.h"
+ #include "net/websockets/websocket_frame.h"
++#include "net/websockets/datasipper_websocket_observer.h"
+ #include "net/websockets/websocket_handshake_request_info.h"
+ #include "net/websockets/websocket_handshake_response_info.h"
+ #include "net/websockets/websocket_stream.h"
+@@ -144,6 +145,11 @@ WebSocketChannel::WebSocketChannel(
+       send_quota_high_water_mark_(send_quota_low_water_mark_ * 2),
+       current_receive_quota_(0),
+       state_(FRESHLY_CONSTRUCTED) {
++  
++  // Initialize DataSipper WebSocket observer if enabled
++  if (base::FeatureList::IsEnabled(chrome::features::kDataSipperNetworkInterception)) {
++    datasipper_observer_ = std::make_unique<DataSipperWebSocketObserver>(url);
++  }
+ }
+ 
+ WebSocketChannel::~WebSocketChannel() {
+@@ -167,6 +173,11 @@ void WebSocketChannel::SendFrame(bool fin,
+     return;
+   }
+ 
++  // Notify DataSipper observer of outgoing frame
++  if (datasipper_observer_) {
++    datasipper_observer_->OnSendFrame(fin, opcode, data);
++  }
++
+   if (data.size() > INT_MAX) {
+     NOTREACHED();
+     return;
+@@ -499,6 +510,11 @@ void WebSocketChannel::OnReadDone(bool fin,
+                                   WebSocketFrameHeader::OpCode opcode,
+                                   const std::vector<char>& data) {
+   DCHECK_NE(FRESHLY_CONSTRUCTED, state_);
++  
++  // Notify DataSipper observer of incoming frame
++  if (datasipper_observer_) {
++    datasipper_observer_->OnReceiveFrame(fin, opcode, data);
++  }
++
+   switch (opcode) {
+     case WebSocketFrameHeader::kOpCodeText:    // fall-thru
+     case WebSocketFrameHeader::kOpCodeBinary:
+@@ -652,6 +668,11 @@ void WebSocketChannel::OnStartOpeningHandshake(
+ 
+ void WebSocketChannel::OnFinishOpeningHandshake(
+     std::unique_ptr<WebSocketHandshakeResponseInfo> response) {
++  
++  // Notify DataSipper observer of connection establishment
++  if (datasipper_observer_) {
++    datasipper_observer_->OnConnectionEstablished(response.get());
++  }
++
+   DCHECK_EQ(CONNECTING, state_);
+   DCHECK(stream_);
+ 
+@@ -690,6 +711,11 @@ void WebSocketChannel::OnSSLCertificateError(
+ }
+ 
+ void WebSocketChannel::OnFailChannel(const std::string& message) {
++  
++  // Notify DataSipper observer of connection failure
++  if (datasipper_observer_) {
++    datasipper_observer_->OnConnectionFailed(message);
++  }
++
+   DCHECK_NE(FRESHLY_CONSTRUCTED, state_);
+   DCHECK_NE(CLOSED, state_);
+ 
+@@ -714,6 +740,11 @@ void WebSocketChannel::OnFailChannel(const std::string& message) {
+ }
+ 
+ void WebSocketChannel::OnDropChannel(bool was_clean, uint16_t code, const std::string& reason) {
++  
++  // Notify DataSipper observer of connection closure
++  if (datasipper_observer_) {
++    datasipper_observer_->OnConnectionClosed(was_clean, code, reason);
++  }
++
+   DCHECK_NE(FRESHLY_CONSTRUCTED, state_);
+   bool sending_error_code = false;
+   if (state_ == RECV_CLOSED) {
+--- /dev/null
++++ b/net/websockets/datasipper_websocket_observer.h
+@@ -0,0 +1,78 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef NET_WEBSOCKETS_DATASIPPER_WEBSOCKET_OBSERVER_H_
++#define NET_WEBSOCKETS_DATASIPPER_WEBSOCKET_OBSERVER_H_
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "net/websockets/websocket_frame.h"
++#include "url/gurl.h"
++
++namespace net {
++class WebSocketHandshakeResponseInfo;
++}
++
++namespace net {
++
++// Observer class that captures WebSocket messages and connection events
++// for the DataSipper monitoring panel.
++class DataSipperWebSocketObserver {
++ public:
++  explicit DataSipperWebSocketObserver(const GURL& url);
++  ~DataSipperWebSocketObserver();
++
++  DataSipperWebSocketObserver(const DataSipperWebSocketObserver&) = delete;
++  DataSipperWebSocketObserver& operator=(const DataSipperWebSocketObserver&) = delete;
++
++  // WebSocket event callbacks
++  void OnConnectionEstablished(const WebSocketHandshakeResponseInfo* response);
++  void OnConnectionFailed(const std::string& error_message);
++  void OnConnectionClosed(bool was_clean, uint16_t code, const std::string& reason);
++  
++  void OnSendFrame(bool fin, 
++                  WebSocketFrameHeader::OpCode opcode, 
++                  const std::vector<char>& data);
++  void OnReceiveFrame(bool fin,
++                     WebSocketFrameHeader::OpCode opcode,
++                     const std::vector<char>& data);
++
++ private:
++  struct MessageInfo {
++    std::string connection_id;
++    base::Time timestamp;
++    bool is_outgoing;
++    WebSocketFrameHeader::OpCode opcode;
++    std::string payload;
++    bool fin;
++    size_t payload_size;
++  };
++
++  struct ConnectionInfo {
++    std::string connection_id;
++    GURL url;
++    base::Time start_time;
++    base::Time end_time;
++    bool was_clean_close = false;
++    uint16_t close_code = 0;
++    std::string close_reason;
++    std::string error_message;
++    size_t messages_sent = 0;
++    size_t messages_received = 0;
++    size_t bytes_sent = 0;
++    size_t bytes_received = 0;
++  };
++
++  // Helper methods
++  std::string GenerateConnectionId();
++  std::string OpCodeToString(WebSocketFrameHeader::OpCode opcode);
++  void ProcessMessage(const MessageInfo& message);
++  void SendToDataSipperPanel(const MessageInfo& message);
++  void StoreInDatabase(const MessageInfo& message);
++  void UpdateConnectionStats(const MessageInfo& message);
++
++  GURL url_;
++  std::string connection_id_;
++  std::unique_ptr<ConnectionInfo> connection_info_;
++  base::WeakPtrFactory<DataSipperWebSocketObserver> weak_factory_{this};
++};
++
++}  // namespace net
++
++#endif  // NET_WEBSOCKETS_DATASIPPER_WEBSOCKET_OBSERVER_H_
+--- /dev/null
++++ b/net/websockets/datasipper_websocket_observer.cc
+@@ -0,0 +1,173 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "net/websockets/datasipper_websocket_observer.h"
++
++#include "base/logging.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "net/websockets/websocket_handshake_response_info.h"
++
++namespace net {
++
++DataSipperWebSocketObserver::DataSipperWebSocketObserver(const GURL& url)
++    : url_(url), connection_id_(GenerateConnectionId()) {
++  connection_info_ = std::make_unique<ConnectionInfo>();
++  connection_info_->connection_id = connection_id_;
++  connection_info_->url = url;
++  connection_info_->start_time = base::Time::Now();
++  
++  DVLOG(1) << "DataSipper WebSocket observer created for: " << url.spec()
++           << " (ID: " << connection_id_ << ")";
++}
++
++DataSipperWebSocketObserver::~DataSipperWebSocketObserver() {
++  if (connection_info_ && connection_info_->end_time.is_null()) {
++    connection_info_->end_time = base::Time::Now();
++    // TODO: Store final connection info in database
++  }
++  
++  DVLOG(1) << "DataSipper WebSocket observer destroyed for connection: " 
++           << connection_id_;
++}
++
++void DataSipperWebSocketObserver::OnConnectionEstablished(
++    const WebSocketHandshakeResponseInfo* response) {
++  DVLOG(1) << "DataSipper: WebSocket connection established - " << url_.spec()
++           << " (ID: " << connection_id_ << ")";
++  
++  // TODO: Capture handshake response headers and other connection details
++  if (response) {
++    // Store handshake information
++  }
++}
++
++void DataSipperWebSocketObserver::OnConnectionFailed(const std::string& error_message) {
++  DVLOG(1) << "DataSipper: WebSocket connection failed - " << url_.spec()
++           << " (ID: " << connection_id_ << ") Error: " << error_message;
++  
++  connection_info_->error_message = error_message;
++  connection_info_->end_time = base::Time::Now();
++}
++
++void DataSipperWebSocketObserver::OnConnectionClosed(bool was_clean, 
++                                                   uint16_t code, 
++                                                   const std::string& reason) {
++  DVLOG(1) << "DataSipper: WebSocket connection closed - " << url_.spec()
++           << " (ID: " << connection_id_ << ") Clean: " << was_clean
++           << " Code: " << code << " Reason: " << reason;
++  
++  connection_info_->was_clean_close = was_clean;
++  connection_info_->close_code = code;
++  connection_info_->close_reason = reason;
++  connection_info_->end_time = base::Time::Now();
++  
++  // TODO: Store final connection summary in database
++}
++
++void DataSipperWebSocketObserver::OnSendFrame(bool fin,
++                                            WebSocketFrameHeader::OpCode opcode,
++                                            const std::vector<char>& data) {
++  MessageInfo message;
++  message.connection_id = connection_id_;
++  message.timestamp = base::Time::Now();
++  message.is_outgoing = true;
++  message.opcode = opcode;
++  message.fin = fin;
++  message.payload_size = data.size();
++  
++  // Convert data to string for text frames, or store as hex for binary
++  if (opcode == WebSocketFrameHeader::kOpCodeText) {
++    message.payload = std::string(data.begin(), data.end());
++  } else if (opcode == WebSocketFrameHeader::kOpCodeBinary) {
++    // Store binary data as hex string (limited size for display)
++    size_t display_size = std::min(data.size(), size_t(1024));
++    message.payload = base::HexEncode(data.data(), display_size);
++    if (data.size() > display_size) {
++      message.payload += "... (truncated)";
++    }
++  } else {
++    message.payload = "[" + OpCodeToString(opcode) + " frame]";
++  }
++  
++  ProcessMessage(message);
++  UpdateConnectionStats(message);
++  
++  DVLOG(2) << "DataSipper: WebSocket SEND " << OpCodeToString(opcode) 
++           << " (" << data.size() << " bytes) - " << connection_id_;
++}
++
++void DataSipperWebSocketObserver::OnReceiveFrame(bool fin,
++                                               WebSocketFrameHeader::OpCode opcode,
++                                               const std::vector<char>& data) {
++  MessageInfo message;
++  message.connection_id = connection_id_;
++  message.timestamp = base::Time::Now();
++  message.is_outgoing = false;
++  message.opcode = opcode;
++  message.fin = fin;
++  message.payload_size = data.size();
++  
++  // Convert data to string for text frames, or store as hex for binary
++  if (opcode == WebSocketFrameHeader::kOpCodeText) {
++    message.payload = std::string(data.begin(), data.end());
++  } else if (opcode == WebSocketFrameHeader::kOpCodeBinary) {
++    // Store binary data as hex string (limited size for display)
++    size_t display_size = std::min(data.size(), size_t(1024));
++    message.payload = base::HexEncode(data.data(), display_size);
++    if (data.size() > display_size) {
++      message.payload += "... (truncated)";
++    }
++  } else {
++    message.payload = "[" + OpCodeToString(opcode) + " frame]";
++  }
++  
++  ProcessMessage(message);
++  UpdateConnectionStats(message);
++  
++  DVLOG(2) << "DataSipper: WebSocket RECV " << OpCodeToString(opcode)
++           << " (" << data.size() << " bytes) - " << connection_id_;
++}
++
++std::string DataSipperWebSocketObserver::GenerateConnectionId() {
++  return "ws_" + base::NumberToString(base::RandUint64());
++}
++
++std::string DataSipperWebSocketObserver::OpCodeToString(WebSocketFrameHeader::OpCode opcode) {
++  switch (opcode) {
++    case WebSocketFrameHeader::kOpCodeText:
++      return "TEXT";
++    case WebSocketFrameHeader::kOpCodeBinary:
++      return "BINARY";
++    case WebSocketFrameHeader::kOpCodeClose:
++      return "CLOSE";
++    case WebSocketFrameHeader::kOpCodePing:
++      return "PING";
++    case WebSocketFrameHeader::kOpCodePong:
++      return "PONG";
++    default:
++      return "UNKNOWN";
++  }
++}
++
++void DataSipperWebSocketObserver::ProcessMessage(const MessageInfo& message) {
++  // Send to DataSipper panel for real-time display
++  SendToDataSipperPanel(message);
++  
++  // Store in database for persistence
++  StoreInDatabase(message);
++}
++
++void DataSipperWebSocketObserver::SendToDataSipperPanel(const MessageInfo& message) {
++  // TODO: Implement IPC to send WebSocket message to DataSipper UI panel
++}
++
++void DataSipperWebSocketObserver::StoreInDatabase(const MessageInfo& message) {
++  // TODO: Implement database storage for WebSocket messages
++}
++
++void DataSipperWebSocketObserver::UpdateConnectionStats(const MessageInfo& message) {
++  if (message.is_outgoing) {
++    connection_info_->messages_sent++;
++    connection_info_->bytes_sent += message.payload_size;
++  } else {
++    connection_info_->messages_received++;
++    connection_info_->bytes_received += message.payload_size;
++  }
++}
++
++}  // namespace net
+--- a/net/websockets/BUILD.gn
++++ b/net/websockets/BUILD.gn
+@@ -36,6 +36,8 @@ component("websockets") {
+     "websocket_basic_stream_adapters.h",
+     "websocket_channel.cc",
+     "websocket_channel.h",
++    "datasipper_websocket_observer.cc",
++    "datasipper_websocket_observer.h",
+     "websocket_deflate_parameters.cc",
+     "websocket_deflate_parameters.h",
+     "websocket_deflate_predictor.h",

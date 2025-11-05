@@ -1,0 +1,182 @@
+# DataSipper: Browser UI integration for monitoring panel
+#
+# This patch integrates the DataSipper monitoring panel into the browser UI
+# by adding toolbar button and slide-out panel container.
+#
+# Affects:
+# - chrome/browser/ui/views/frame/browser_view.h
+# - chrome/browser/ui/views/frame/browser_view.cc
+# - chrome/browser/ui/views/toolbar/toolbar_view.h
+# - chrome/browser/ui/views/toolbar/toolbar_view.cc
+# - chrome/app/chrome_command_ids.h
+
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -150,6 +150,7 @@
+ #define IDC_DEV_TOOLS_INSPECT                   40023
+ #define IDC_UPGRADE_DIALOG                      40024
+ #define IDC_PROFILING_ENABLED                   40028
++#define IDC_DATASIPPER_TOGGLE                   40029
+ 
+ #define IDC_VIEW_PASSWORDS                      40030
+ #define IDC_VIEW_CLEAR_BROWSING_DATA            40031
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -110,6 +110,7 @@ class BrowserViewLayout;
+ class ContentsLayoutManager;
+ class TabSearchBubbleHost;
+ class TopContainerBackground;
++class DataSipperPanel;
+ 
+ namespace content {
+ class KeyboardEventProcessingResult;
+@@ -486,6 +487,10 @@ class BrowserView : public BrowserWindow,
+   // Called when the top controls slide state changes.
+   void OnTopControlsSlideStateChanged(bool shown);
+ 
++  // DataSipper panel management
++  void ToggleDataSipperPanel();
++  bool IsDataSipperPanelVisible() const;
++
+  private:
+   // Do not friend BrowserViewLayout. Use the BrowserViewLayoutDelegate
+   // interface to keep these two classes decoupled and testable.
+@@ -799,6 +804,9 @@ class BrowserView : public BrowserWindow,
+   // The class that contains all the child views.
+   views::View* contents_container_ = nullptr;
+ 
++  // DataSipper monitoring panel
++  std::unique_ptr<DataSipperPanel> datasipper_panel_;
++
+   // The browser frame that hosts this view.
+   std::unique_ptr<BrowserFrame> frame_;
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -145,6 +145,7 @@
+ #include "chrome/browser/ui/views/translate/translate_bubble_view.h"
+ #include "chrome/browser/ui/views/user_education/browser_feature_promo_controller.h"
+ #include "chrome/browser/ui/views/web_apps/frame_toolbar/web_app_frame_toolbar_view.h"
++#include "chrome/browser/ui/views/datasipper/datasipper_panel.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/webui/chrome_web_ui_controller_factory.h"
+ #include "chrome/browser/upgrade_detector/upgrade_detector.h"
+@@ -2043,6 +2044,16 @@ void BrowserView::ExecuteCommand(int id, int event_flags) {
+     case IDC_TOGGLE_REQUEST_TABLET_SITE:
+       chrome::ToggleRequestTabletSite(browser_);
+       break;
++    case IDC_DATASIPPER_TOGGLE:
++      ToggleDataSipperPanel();
++      break;
++    default:
++      NOTREACHED() << "Received Unhandled Command: " << id;
++      break;
++  }
++}
++
++void BrowserView::ToggleDataSipperPanel() {
++  if (!datasipper_panel_) {
++    datasipper_panel_ = std::make_unique<DataSipperPanel>(browser_);
++    contents_container_->AddChildView(datasipper_panel_.get());
++  }
++  
++  datasipper_panel_->Toggle();
++  Layout();
++}
++
++bool BrowserView::IsDataSipperPanelVisible() const {
++  return datasipper_panel_ && datasipper_panel_->GetVisible();
++}
++
++void BrowserView::UpdateUIForContents(content::WebContents* contents) {
++  TRACE_EVENT0("ui", "BrowserView::UpdateUIForContents");
++  
++  // Update DataSipper panel with new WebContents if visible
++  if (datasipper_panel_ && datasipper_panel_->GetVisible()) {
++    datasipper_panel_->OnWebContentsChanged(contents);
++  }
++  
++  // Existing implementation continues...
++  // [Rest of the existing method unchanged]
++}
++
++bool BrowserView::IsCommandEnabled(int command) const {
++  switch (command) {
++    case IDC_DATASIPPER_TOGGLE:
++      return base::FeatureList::IsEnabled(chrome::features::kDataSipperEnabled);
+     default:
+       return chrome::IsCommandEnabled(browser_, command);
+   }
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -53,6 +53,7 @@ class ExtensionsToolbarContainer;
+ class HomeButton;
+ class ReloadButton;
+ class ToolbarButton;
++class DataSipperButton;
+ 
+ // The Browser Window's toolbar.
+ class ToolbarView : public views::AccessiblePaneView,
+@@ -213,6 +214,7 @@ class ToolbarView : public views::AccessiblePaneView,
+   raw_ptr<ReloadButton> reload_;
+   raw_ptr<HomeButton> home_;
+   raw_ptr<ExtensionsToolbarContainer> extensions_container_;
++  raw_ptr<DataSipperButton> datasipper_button_;
+   raw_ptr<BrowserAppMenuButton> app_menu_button_;
+   std::unique_ptr<AppMenuIconController> app_menu_icon_controller_;
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -54,6 +54,7 @@
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view_interactive_uitest.h"
+ #include "chrome/browser/ui/views/translate/translate_icon_view.h"
++#include "chrome/browser/ui/views/datasipper/datasipper_button.h"
+ #include "chrome/browser/upgrade_detector/upgrade_detector.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/pref_names.h"
+@@ -276,6 +277,13 @@ void ToolbarView::Init() {
+   extensions_container_ = AddChildView(
+       std::make_unique<ExtensionsToolbarContainer>(browser_));
+ 
++  // Add DataSipper button if feature is enabled
++  if (base::FeatureList::IsEnabled(chrome::features::kDataSipperEnabled)) {
++    auto datasipper_button = std::make_unique<DataSipperButton>(browser_);
++    datasipper_button_ = AddChildView(std::move(datasipper_button));
++  }
++
+   app_menu_button_ = AddChildView(std::make_unique<BrowserAppMenuButton>(this));
+   app_menu_button_->SetTriggerableEventFlags(
+       ui::EF_LEFT_MOUSE_BUTTON | ui::EF_RIGHT_MOUSE_BUTTON);
+@@ -421,6 +429,8 @@ void ToolbarView::Layout() {
+   extensions_container_->SetBounds(next_element_x, 0, extensions_width,
+                                    height());
+   next_element_x += extensions_width;
++  
++  LayoutDataSipperButton(&next_element_x);
+ 
+   // The browser actions need to do a layout explicitly, because when an
+   // extension is loaded/unloaded/anominated, BrowserActionContainer removes
+@@ -432,6 +442,17 @@ void ToolbarView::Layout() {
+   app_menu_button_->SetBounds(next_element_x, 0, app_menu_width, height());
+ }
+ 
++void ToolbarView::LayoutDataSipperButton(int* x) {
++  if (!datasipper_button_) return;
++  
++  const int button_width = datasipper_button_->GetPreferredSize().width();
++  const int margin = GetLayoutConstant(TOOLBAR_STANDARD_SPACING);
++  
++  datasipper_button_->SetBounds(*x, 0, button_width, height());
++  *x += button_width + margin;
++}
++
+ void ToolbarView::UpdateForWebContents(content::WebContents* contents) {
+   // Update DataSipper button state based on current web contents
++  if (datasipper_button_) {
++    datasipper_button_->UpdateForWebContents(contents);
++  }
++  
+   if (extensions_container_)
+     extensions_container_->UpdateAllIcons();
+ }

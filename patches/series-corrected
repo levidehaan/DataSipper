@@ -1,0 +1,15 @@
+# DataSipper Patch Series - Corrected for Current Chromium
+# This file defines the order in which patches are applied to Chromium
+# Updated for commit 6d0796400dc7f4912cf196e27314fd51731de2d2
+
+# Phase 1: Build System Integration (Essential)
+upstream-fixes/build-system-fixes-corrected.patch
+
+# Phase 2: Core Network Interception (Essential for DataSipper functionality)
+core/network-interception/url-loader-interceptor-corrected.patch
+
+# Phase 3: Additional Features (Optional - can be added later)
+# TODO: Create corrected versions of these patches
+# core/network-interception/websocket-interceptor-corrected.patch
+# core/ui-panel/browser-ui-integration-corrected.patch
+# core/datasipper/data-storage-infrastructure-corrected.patch

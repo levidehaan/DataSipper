@@ -1,0 +1,52 @@
+# Copyright 2024 The DataSipper Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/features.gni")
+
+# DataSipper streaming detection library
+component("streaming") {
+  sources = [
+    "dom_stream_tracker.cc",
+    "dom_stream_tracker.h",
+    "stream_types.cc",
+    "stream_types.h",
+  ]
+
+  # JavaScript resources (will be loaded at runtime for now)
+  # TODO: Convert to GRIT resources for production
+  data = [
+    "dom_mutation_tracker.js",
+  ]
+
+  defines = [ "DATASIPPER_IMPLEMENTATION" ]
+
+  deps = [
+    "//base",
+    "//content/public/browser",
+    "//url",
+  ]
+
+  # Allow other components to depend on this
+  visibility = [
+    "//components/datasipper/*",
+    "//chrome/browser/datasipper/*",
+  ]
+}
+
+# Unit tests (to be implemented)
+source_set("unit_tests") {
+  testonly = true
+
+  sources = [
+    # TODO: Add test files
+    # "stream_types_unittest.cc",
+    # "dom_stream_tracker_unittest.cc",
+  ]
+
+  deps = [
+    ":streaming",
+    "//base/test:test_support",
+    "//testing/gtest",
+  ]
+}

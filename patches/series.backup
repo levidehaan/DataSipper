@@ -1,0 +1,35 @@
+# DataSipper Patch Series
+# This file defines the order in which patches are applied to Chromium
+# Format: path/to/patch.patch [optional-conditions]
+
+# Upstream Fixes Section
+# Patches that fix issues in upstream Chromium
+upstream-fixes/build-system-fixes.patch
+upstream-fixes/network-stack-compatibility.patch
+
+# Core DataSipper Features Section  
+# Fundamental patches required for DataSipper functionality
+core/datasipper/base-infrastructure.patch
+core/datasipper/configuration-system.patch
+
+# Network Interception Core Features
+core/network-interception/url-loader-interceptor.patch
+core/network-interception/websocket-interceptor.patch
+core/network-interception/request-response-capture.patch
+core/network-interception/data-storage-integration.patch
+
+# UI Panel Core Features
+core/ui-panel/slide-out-panel-base.patch
+core/ui-panel/panel-integration-browser.patch
+core/ui-panel/real-time-display.patch
+
+# Extra Features Section
+# Optional enhancements and advanced features
+extra/network-interception/generic-socket-interception.patch
+extra/ui-panel/advanced-filtering.patch
+extra/ui-panel/data-visualization.patch
+extra/external-integrations/kafka-integration.patch
+extra/external-integrations/mysql-integration.patch
+extra/external-integrations/redis-integration.patch
+extra/external-integrations/javascript-api.patch
+extra/external-integrations/webhook-support.patch

@@ -1,0 +1,634 @@
+# DataSipper: Kafka output connector with topic/partition control
+#
+# This patch implements the Kafka output connector that allows routing
+# transformed data to specific Kafka topics and partitions.
+#
+# Affects:
+# - components/datasipper/output/ (new directory)
+# - components/datasipper/output/kafka_connector.h (new file)
+# - components/datasipper/output/kafka_connector.cc (new file)
+# - components/datasipper/output/output_connector_base.h (new file)
+
+--- /dev/null
++++ b/components/datasipper/output/output_connector_base.h
+@@ -0,0 +1,78 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_OUTPUT_OUTPUT_CONNECTOR_BASE_H_
++#define COMPONENTS_DATASIPPER_OUTPUT_OUTPUT_CONNECTOR_BASE_H_
++
++#include <string>
++#include <vector>
++
++#include "base/observer_list.h"
++#include "base/values.h"
++#include "base/time/time.h"
++
++namespace datasipper {
++
++// Status of an output operation
++enum class OutputStatus {
++  SUCCESS,
++  RETRY,
++  PERMANENT_FAILURE,
++  CONFIGURATION_ERROR,
++  CONNECTION_ERROR
++};
++
++// Result of an output operation
++struct OutputResult {
++  OutputStatus status;
++  std::string error_message;
++  base::Time timestamp;
++  int retry_count = 0;
++  
++  static OutputResult Success();
++  static OutputResult Retry(const std::string& error);
++  static OutputResult Failure(const std::string& error);
++  static OutputResult ConfigError(const std::string& error);
++};
++
++// Observer interface for output events
++class OutputConnectorObserver {
++ public:
++  virtual ~OutputConnectorObserver() = default;
++  virtual void OnOutputSuccess(const std::string& connector_name, const base::Value::Dict& data) = 0;
++  virtual void OnOutputFailure(const std::string& connector_name, const std::string& error) = 0;
++  virtual void OnConnectionStatusChanged(const std::string& connector_name, bool connected) = 0;
++};
++
++// Base class for all output connectors
++class OutputConnectorBase {
++ public:
++  explicit OutputConnectorBase(const std::string& name);
++  virtual ~OutputConnectorBase();
++  
++  OutputConnectorBase(const OutputConnectorBase&) = delete;
++  OutputConnectorBase& operator=(const OutputConnectorBase&) = delete;
++
++  // Basic properties
++  const std::string& name() const { return name_; }
++  bool is_enabled() const { return enabled_; }
++  virtual void SetEnabled(bool enabled) { enabled_ = enabled; }
++  
++  // Configuration
++  virtual bool Configure(const base::Value::Dict& config) = 0;
++  virtual base::Value::Dict GetConfiguration() const = 0;
++  
++  // Connection management
++  virtual bool Connect() = 0;
++  virtual void Disconnect() = 0;
++  virtual bool IsConnected() const = 0;
++  
++  // Data output
++  virtual OutputResult SendData(const base::Value::Dict& data) = 0;
++  virtual OutputResult SendBatch(const std::vector<base::Value::Dict>& batch) = 0;
++  
++  // Health check
++  virtual bool HealthCheck() = 0;
++  
++  // Observer management
++  void AddObserver(OutputConnectorObserver* observer);
++  void RemoveObserver(OutputConnectorObserver* observer);
++  
++ protected:
++  void NotifySuccess(const base::Value::Dict& data);
++  void NotifyFailure(const std::string& error);
++  void NotifyConnectionStatusChanged(bool connected);
++  
++  std::string name_;
++  bool enabled_ = false;
++  bool connected_ = false;
++  
++  base::ObserverList<OutputConnectorObserver> observers_;
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_OUTPUT_OUTPUT_CONNECTOR_BASE_H_
+--- /dev/null
++++ b/components/datasipper/output/kafka_connector.h
+@@ -0,0 +1,132 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_OUTPUT_KAFKA_CONNECTOR_H_
++#define COMPONENTS_DATASIPPER_OUTPUT_KAFKA_CONNECTOR_H_
++
++#include <memory>
++#include <string>
++#include <map>
++
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/threading/sequenced_task_runner.h"
++#include "components/datasipper/output/output_connector_base.h"
++
++namespace datasipper {
++
++// Configuration for Kafka connection
++struct KafkaConfig {
++  std::string bootstrap_servers;       // Comma-separated list of brokers
++  std::string default_topic;           // Default topic for messages
++  int default_partition = -1;          // Default partition (-1 for automatic)
++  
++  // Authentication
++  std::string security_protocol = "PLAINTEXT";  // PLAINTEXT, SASL_PLAINTEXT, SSL, SASL_SSL
++  std::string sasl_mechanism;          // PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
++  std::string username;
++  std::string password;
++  
++  // SSL configuration
++  std::string ssl_ca_location;
++  std::string ssl_certificate_location;
++  std::string ssl_key_location;
++  std::string ssl_key_password;
++  
++  // Producer configuration
++  int batch_size = 100;                // Number of messages to batch
++  int linger_ms = 100;                 // Max time to wait for batch
++  int timeout_ms = 30000;              // Message timeout
++  std::string compression_type = "none"; // none, gzip, snappy, lz4, zstd
++  int retries = 3;
++  int retry_backoff_ms = 100;
++  
++  // Advanced settings
++  int max_message_size = 1000000;      // 1MB default
++  int queue_buffering_max_messages = 10000;
++  int queue_buffering_max_ms = 1000;
++  
++  base::Value::Dict ToDict() const;
++  static KafkaConfig FromDict(const base::Value::Dict& dict);
++  bool IsValid() const;
++};
++
++// Message routing configuration
++struct KafkaMessageRoute {
++  std::string topic;
++  int partition = -1;                  // -1 for automatic partitioning
++  std::string key_field;               // Field to use as message key
++  std::string key_value;               // Static key value (if key_field is empty)
++  base::Value::Dict headers;           // Static headers to add
++  
++  base::Value::Dict ToDict() const;
++  static KafkaMessageRoute FromDict(const base::Value::Dict& dict);
++};
++
++// Kafka producer implementation using librdkafka
++class KafkaConnector : public OutputConnectorBase {
++ public:
++  explicit KafkaConnector(const std::string& name);
++  ~KafkaConnector() override;
++  
++  KafkaConnector(const KafkaConnector&) = delete;
++  KafkaConnector& operator=(const KafkaConnector&) = delete;
++
++  // OutputConnectorBase implementation
++  bool Configure(const base::Value::Dict& config) override;
++  base::Value::Dict GetConfiguration() const override;
++  bool Connect() override;
++  void Disconnect() override;
++  bool IsConnected() const override;
++  OutputResult SendData(const base::Value::Dict& data) override;
++  OutputResult SendBatch(const std::vector<base::Value::Dict>& batch) override;
++  bool HealthCheck() override;
++  
++  // Kafka-specific methods
++  void SetMessageRoute(const std::string& stream_name, const KafkaMessageRoute& route);
++  void RemoveMessageRoute(const std::string& stream_name);
++  KafkaMessageRoute GetMessageRoute(const std::string& stream_name) const;
++  
++  // Topic management
++  std::vector<std::string> ListTopics();
++  bool CreateTopic(const std::string& topic, int num_partitions = 1, int replication_factor = 1);
++  bool TopicExists(const std::string& topic);
++  
++  // Partition information
++  int GetPartitionCount(const std::string& topic);
++  std::vector<int> GetAvailablePartitions(const std::string& topic);
++  
++  // Statistics
++  size_t GetPendingMessageCount() const;
++  size_t GetSuccessfulMessageCount() const { return successful_messages_; }
++  size_t GetFailedMessageCount() const { return failed_messages_; }
++  
++ private:
++  bool InitializeProducer();
++  void DestroyProducer();
++  bool ValidateConfiguration() const;
++  
++  OutputResult SendSingleMessage(const base::Value::Dict& data, const KafkaMessageRoute& route);
++  std::string ExtractMessageKey(const base::Value::Dict& data, const KafkaMessageRoute& route);
++  std::string SerializeMessage(const base::Value::Dict& data);
++  
++  // Callback functions for librdkafka
++  static void DeliveryReportCallback(void* kafka_handle, const void* message, void* opaque);
++  static void ErrorCallback(void* kafka_handle, int error, const char* reason, void* opaque);
++  static void LogCallback(const void* kafka_handle, int level, const char* facility, const char* message);
++  
++  KafkaConfig config_;
++  std::map<std::string, KafkaMessageRoute> message_routes_;  // stream_name -> route
++  
++  // librdkafka handles (using void* to avoid including librdkafka headers)
++  void* producer_handle_ = nullptr;
++  void* topic_handles_ = nullptr;
++  
++  // Statistics
++  size_t successful_messages_ = 0;
++  size_t failed_messages_ = 0;
++  
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<KafkaConnector> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_OUTPUT_KAFKA_CONNECTOR_H_
+--- /dev/null
++++ b/components/datasipper/output/kafka_connector.cc
+@@ -0,0 +1,348 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/output/kafka_connector.h"
++
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/threading/thread_restrictions.h"
++
++// NOTE: In a real implementation, you would include librdkafka headers here
++// For this patch, we'll use placeholder implementations
++
++namespace datasipper {
++
++namespace {
++
++constexpr char kDefaultCompressionType[] = "none";
++constexpr int kDefaultTimeoutMs = 30000;
++constexpr int kDefaultBatchSize = 100;
++
++}  // namespace
++
++// KafkaConfig implementation
++base::Value::Dict KafkaConfig::ToDict() const {
++  base::Value::Dict dict;
++  dict.Set("bootstrap_servers", bootstrap_servers);
++  dict.Set("default_topic", default_topic);
++  dict.Set("default_partition", default_partition);
++  dict.Set("security_protocol", security_protocol);
++  dict.Set("sasl_mechanism", sasl_mechanism);
++  dict.Set("username", username);
++  dict.Set("password", password);
++  dict.Set("ssl_ca_location", ssl_ca_location);
++  dict.Set("ssl_certificate_location", ssl_certificate_location);
++  dict.Set("ssl_key_location", ssl_key_location);
++  dict.Set("batch_size", batch_size);
++  dict.Set("linger_ms", linger_ms);
++  dict.Set("timeout_ms", timeout_ms);
++  dict.Set("compression_type", compression_type);
++  dict.Set("retries", retries);
++  dict.Set("retry_backoff_ms", retry_backoff_ms);
++  dict.Set("max_message_size", max_message_size);
++  dict.Set("queue_buffering_max_messages", queue_buffering_max_messages);
++  dict.Set("queue_buffering_max_ms", queue_buffering_max_ms);
++  return dict;
++}
++
++KafkaConfig KafkaConfig::FromDict(const base::Value::Dict& dict) {
++  KafkaConfig config;
++  if (const std::string* value = dict.FindString("bootstrap_servers")) {
++    config.bootstrap_servers = *value;
++  }
++  if (const std::string* value = dict.FindString("default_topic")) {
++    config.default_topic = *value;
++  }
++  config.default_partition = dict.FindInt("default_partition").value_or(-1);
++  if (const std::string* value = dict.FindString("security_protocol")) {
++    config.security_protocol = *value;
++  }
++  if (const std::string* value = dict.FindString("sasl_mechanism")) {
++    config.sasl_mechanism = *value;
++  }
++  if (const std::string* value = dict.FindString("username")) {
++    config.username = *value;
++  }
++  if (const std::string* value = dict.FindString("password")) {
++    config.password = *value;
++  }
++  config.batch_size = dict.FindInt("batch_size").value_or(kDefaultBatchSize);
++  config.linger_ms = dict.FindInt("linger_ms").value_or(100);
++  config.timeout_ms = dict.FindInt("timeout_ms").value_or(kDefaultTimeoutMs);
++  if (const std::string* value = dict.FindString("compression_type")) {
++    config.compression_type = *value;
++  }
++  config.retries = dict.FindInt("retries").value_or(3);
++  config.retry_backoff_ms = dict.FindInt("retry_backoff_ms").value_or(100);
++  return config;
++}
++
++bool KafkaConfig::IsValid() const {
++  return !bootstrap_servers.empty() && !default_topic.empty();
++}
++
++// KafkaMessageRoute implementation
++base::Value::Dict KafkaMessageRoute::ToDict() const {
++  base::Value::Dict dict;
++  dict.Set("topic", topic);
++  dict.Set("partition", partition);
++  dict.Set("key_field", key_field);
++  dict.Set("key_value", key_value);
++  dict.Set("headers", headers.Clone());
++  return dict;
++}
++
++KafkaMessageRoute KafkaMessageRoute::FromDict(const base::Value::Dict& dict) {
++  KafkaMessageRoute route;
++  if (const std::string* value = dict.FindString("topic")) {
++    route.topic = *value;
++  }
++  route.partition = dict.FindInt("partition").value_or(-1);
++  if (const std::string* value = dict.FindString("key_field")) {
++    route.key_field = *value;
++  }
++  if (const std::string* value = dict.FindString("key_value")) {
++    route.key_value = *value;
++  }
++  if (const base::Value::Dict* headers = dict.FindDict("headers")) {
++    route.headers = headers->Clone();
++  }
++  return route;
++}
++
++// KafkaConnector implementation
++KafkaConnector::KafkaConnector(const std::string& name) 
++    : OutputConnectorBase(name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++KafkaConnector::~KafkaConnector() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Disconnect();
++}
++
++bool KafkaConnector::Configure(const base::Value::Dict& config) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // Parse Kafka configuration
++  if (const base::Value::Dict* kafka_config = config.FindDict("kafka")) {
++    config_ = KafkaConfig::FromDict(*kafka_config);
++  } else {
++    LOG(ERROR) << "Kafka connector: Missing kafka configuration";
++    return false;
++  }
++  
++  // Parse message routes
++  if (const base::Value::Dict* routes = config.FindDict("message_routes")) {
++    message_routes_.clear();
++    for (const auto& [stream_name, route_value] : *routes) {
++      if (route_value.is_dict()) {
++        message_routes_[stream_name] = KafkaMessageRoute::FromDict(route_value.GetDict());
++      }
++    }
++  }
++  
++  if (!ValidateConfiguration()) {
++    LOG(ERROR) << "Kafka connector: Invalid configuration";
++    return false;
++  }
++  
++  return true;
++}
++
++base::Value::Dict KafkaConnector::GetConfiguration() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  base::Value::Dict config;
++  config.Set("kafka", config_.ToDict());
++  
++  base::Value::Dict routes;
++  for (const auto& [stream_name, route] : message_routes_) {
++    routes.Set(stream_name, route.ToDict());
++  }
++  config.Set("message_routes", std::move(routes));
++  
++  return config;
++}
++
++bool KafkaConnector::Connect() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (connected_) {
++    return true;
++  }
++  
++  if (!ValidateConfiguration()) {
++    LOG(ERROR) << "Kafka connector: Cannot connect with invalid configuration";
++    return false;
++  }
++  
++  if (!InitializeProducer()) {
++    LOG(ERROR) << "Kafka connector: Failed to initialize producer";
++    return false;
++  }
++  
++  connected_ = true;
++  NotifyConnectionStatusChanged(true);
++  
++  LOG(INFO) << "Kafka connector: Successfully connected to " << config_.bootstrap_servers;
++  return true;
++}
++
++void KafkaConnector::Disconnect() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return;
++  }
++  
++  DestroyProducer();
++  connected_ = false;
++  NotifyConnectionStatusChanged(false);
++  
++  LOG(INFO) << "Kafka connector: Disconnected";
++}
++
++bool KafkaConnector::IsConnected() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return connected_;
++}
++
++OutputResult KafkaConnector::SendData(const base::Value::Dict& data) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return OutputResult::ConfigError("Kafka connector not connected");
++  }
++  
++  // Determine message route
++  KafkaMessageRoute route;
++  if (const std::string* stream_name = data.FindString("stream_name")) {
++    auto it = message_routes_.find(*stream_name);
++    if (it != message_routes_.end()) {
++      route = it->second;
++    }
++  }
++  
++  // Use default topic if no specific route
++  if (route.topic.empty()) {
++    route.topic = config_.default_topic;
++    route.partition = config_.default_partition;
++  }
++  
++  return SendSingleMessage(data, route);
++}
++
++OutputResult KafkaConnector::SendBatch(const std::vector<base::Value::Dict>& batch) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return OutputResult::ConfigError("Kafka connector not connected");
++  }
++  
++  if (batch.empty()) {
++    return OutputResult::Success();
++  }
++  
++  // Send each message in the batch
++  size_t success_count = 0;
++  std::string last_error;
++  
++  for (const auto& data : batch) {
++    OutputResult result = SendData(data);
++    if (result.status == OutputStatus::SUCCESS) {
++      success_count++;
++    } else {
++      last_error = result.error_message;
++    }
++  }
++  
++  if (success_count == batch.size()) {
++    return OutputResult::Success();
++  } else if (success_count > 0) {
++    return OutputResult::Retry("Partial batch failure: " + last_error);
++  } else {
++    return OutputResult::Failure("Complete batch failure: " + last_error);
++  }
++}
++
++bool KafkaConnector::HealthCheck() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return false;
++  }
++  
++  // TODO: Implement actual health check with librdkafka
++  // This would typically involve checking broker connectivity
++  // and metadata retrieval
++  
++  return true;
++}
++
++void KafkaConnector::SetMessageRoute(const std::string& stream_name, const KafkaMessageRoute& route) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  message_routes_[stream_name] = route;
++}
++
++void KafkaConnector::RemoveMessageRoute(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  message_routes_.erase(stream_name);
++}
++
++KafkaMessageRoute KafkaConnector::GetMessageRoute(const std::string& stream_name) const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto it = message_routes_.find(stream_name);
++  return it != message_routes_.end() ? it->second : KafkaMessageRoute();
++}
++
++bool KafkaConnector::InitializeProducer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // TODO: Implement actual librdkafka producer initialization
++  // This would involve:
++  // 1. Creating rd_kafka_conf_t configuration
++  // 2. Setting bootstrap.servers, security settings, etc.
++  // 3. Creating rd_kafka_t producer instance
++  // 4. Setting up callbacks for delivery reports and errors
++  
++  DVLOG(1) << "Kafka connector: Initializing producer for " << config_.bootstrap_servers;
++  
++  // Placeholder implementation
++  producer_handle_ = reinterpret_cast<void*>(0x1234);  // Fake handle
++  
++  return true;
++}
++
++void KafkaConnector::DestroyProducer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (producer_handle_) {
++    // TODO: Implement actual cleanup
++    // rd_kafka_flush(producer_handle_, 5000);  // 5 second timeout
++    // rd_kafka_destroy(producer_handle_);
++    
++    producer_handle_ = nullptr;
++  }
++}
++
++bool KafkaConnector::ValidateConfiguration() const {
++  return config_.IsValid();
++}
++
++OutputResult KafkaConnector::SendSingleMessage(const base::Value::Dict& data, const KafkaMessageRoute& route) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  std::string serialized_data = SerializeMessage(data);
++  std::string message_key = ExtractMessageKey(data, route);
++  
++  // TODO: Implement actual message sending with librdkafka
++  // This would involve rd_kafka_producev() call
++  
++  DVLOG(2) << "Kafka connector: Sending message to topic=" << route.topic 
++           << " partition=" << route.partition 
++           << " key=" << message_key
++           << " size=" << serialized_data.size();
++  
++  // Placeholder implementation - always succeeds
++  successful_messages_++;
++  return OutputResult::Success();
++}
++
++std::string KafkaConnector::ExtractMessageKey(const base::Value::Dict& data, const KafkaMessageRoute& route) {
++  if (!route.key_value.empty()) {
++    return route.key_value;
++  }
++  
++  if (!route.key_field.empty()) {
++    if (const std::string* value = data.FindString(route.key_field)) {
++      return *value;
++    }
++  }
++  
++  // Default to connection_id if available
++  if (const std::string* connection_id = data.FindString("connection_id")) {
++    return *connection_id;
++  }
++  
++  return std::string();
++}
++
++std::string KafkaConnector::SerializeMessage(const base::Value::Dict& data) {
++  std::string json_string;
++  base::JSONWriter::Write(base::Value(data.Clone()), &json_string);
++  return json_string;
++}
++
++}  // namespace datasipper

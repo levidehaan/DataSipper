@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2024 The DataSipper Authors. All rights reserved.
+  Use of this source code is governed by a BSD-style license that can be
+  found in the LICENSE file.
+-->
+<grit latest_public_release="0" current_release="1">
+  <outputs>
+    <output filename="grit/datasipper_resources.h" type="rc_header">
+      <emit emit_type='prepend'></emit>
+    </output>
+    <output filename="grit/datasipper_resources_map.cc" type="resource_file_map_source" />
+    <output filename="grit/datasipper_resources_map.h" type="resource_map_header" />
+    <output filename="datasipper_resources.pak" type="data_package" />
+  </outputs>
+  <release seq="1">
+    <includes>
+      <include name="IDR_DATASIPPER_DOM_MUTATION_TRACKER_JS"
+               file="dom_mutation_tracker.js"
+               type="BINDATA"
+               compress="gzip" />
+    </includes>
+  </release>
+</grit>

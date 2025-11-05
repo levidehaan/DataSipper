@@ -1,0 +1,25 @@
+import("//chrome/common/features.gni")
+
+assert(enable_datasipper)
+
+source_set("datasipper") {
+  sources = [
+    "datasipper_network_bridge.cc",
+    "datasipper_network_bridge.h",
+    "datasipper_network_client.cc",
+    "datasipper_network_client.h",
+    "datasipper_service_factory.cc",
+    "datasipper_service_factory.h",
+  ]
+
+  deps = [
+    "//chrome/browser:browser_public_dependencies",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/ui/webui/side_panel/datasipper:mojo_bindings",
+    "//components/datasipper",
+    "//components/datasipper/mojom",
+    "//components/keyed_service/content",
+    "//content/public/browser",
+    "//mojo/public/cpp/bindings",
+  ]
+}

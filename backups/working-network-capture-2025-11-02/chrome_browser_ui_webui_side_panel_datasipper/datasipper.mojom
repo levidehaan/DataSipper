@@ -1,0 +1,81 @@
+// Copyright 2024 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+module side_panel.mojom;
+
+// Extracted data from a webpage
+struct ExtractedData {
+  string type;  // "JSON-LD", "JSON", "HTML Table", "CSV"
+  string label;
+  string data;  // JSON string
+  double confidence;
+};
+
+// Workflow information
+struct WorkflowInfo {
+  string id;
+  string name;
+  string url_pattern;
+  bool enabled;
+  int32 node_count;
+};
+
+// Network request/response data for real-time monitoring
+struct NetworkRequestData {
+  string request_id;
+  string url;
+  string method;  // GET, POST, etc.
+  string type;    // "xhr", "fetch", "websocket", "document", etc.
+  int64 timestamp_ms;
+  int32 status_code;
+  string status_text;
+  map<string, string> request_headers;
+  map<string, string> response_headers;
+  string request_body;
+  string response_body;
+  int64 size_bytes;
+  int64 duration_ms;
+};
+
+// Observer interface for receiving real-time data updates
+interface DataSipperObserver {
+  // Called when a new network request is captured
+  OnNetworkRequestCaptured(NetworkRequestData request);
+
+  // Called when data is extracted from the page
+  OnDataExtracted(ExtractedData data);
+
+  // Called when a WebSocket message is received
+  OnWebSocketMessage(string url, string message, bool is_outgoing);
+};
+
+// Factory for creating the DataSipper page handler
+interface DataSipperPageHandlerFactory {
+  // The WebUI calls this method when the page is first initialized.
+  CreatePageHandler(pending_receiver<DataSipperPageHandler> handler);
+};
+
+// Handler for DataSipper side panel UI
+interface DataSipperPageHandler {
+  // Get extracted data from current tab
+  GetExtractedData() => (array<ExtractedData> data);
+
+  // Get all workflows
+  GetWorkflows() => (array<WorkflowInfo> workflows);
+
+  // Create a new workflow
+  CreateWorkflow(string name, string url_pattern) => (bool success, string workflow_id);
+
+  // Delete a workflow
+  DeleteWorkflow(string workflow_id) => (bool success);
+
+  // Enable/disable a workflow
+  ToggleWorkflow(string workflow_id, bool enabled) => (bool success);
+
+  // Notify the backend that the UI is ready to be shown.
+  ShowUI();
+
+  // Register observer for real-time data updates
+  AddObserver(pending_remote<DataSipperObserver> observer);
+};

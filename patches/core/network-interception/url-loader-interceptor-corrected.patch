@@ -1,0 +1,241 @@
+# DataSipper: Network URL Loader Interception (Corrected)
+#
+# This patch adds DataSipper network request/response interception by integrating
+# with Chromium's network service URL loading infrastructure.
+#
+# Files affected:
+# - services/network/BUILD.gn
+# - services/network/datasipper_url_loader_interceptor.h (new)
+# - services/network/datasipper_url_loader_interceptor.cc (new)
+# - services/network/url_loader.cc
+
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -5,6 +5,7 @@
+ import("//build/config/features.gni")
+ import("//mojo/public/tools/bindings/mojom.gni")
+ import("//net/features.gni")
++import("//chrome/browser/datasipper/buildflags.gni")
+ import("//services/network/public/cpp/features.gni")
+ import("//testing/libfuzzer/fuzzer_test.gni")
+ 
+@@ -234,6 +235,13 @@ component("network_service") {
+     "//url",
+   ]
+ 
++  # DataSipper network interception
++  if (enable_datasipper && enable_datasipper_network_interception) {
++    sources += [
++      "datasipper_url_loader_interceptor.cc",
++      "datasipper_url_loader_interceptor.h",
++    ]
++  }
++
+   public_deps = [
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+
+--- /dev/null
++++ b/services/network/datasipper_url_loader_interceptor.h
+@@ -0,0 +1,65 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef SERVICES_NETWORK_DATASIPPER_URL_LOADER_INTERCEPTOR_H_
++#define SERVICES_NETWORK_DATASIPPER_URL_LOADER_INTERCEPTOR_H_
++
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/gurl.h"
++
++namespace network {
++
++// DataSipper URL loader interceptor that captures HTTP/HTTPS requests and responses
++// for monitoring and data export functionality.
++class DataSipperUrlLoaderInterceptor : public mojom::URLLoaderClient {
++ public:
++  DataSipperUrlLoaderInterceptor(
++      mojo::PendingReceiver<mojom::URLLoaderClient> client_receiver,
++      mojo::PendingRemote<mojom::URLLoaderClient> forwarding_client,
++      const network::ResourceRequest& resource_request);
++  
++  ~DataSipperUrlLoaderInterceptor() override;
++
++  // mojom::URLLoaderClient implementation:
++  void OnReceiveResponse(
++      mojom::URLResponseHeadPtr response_head,
++      mojo::ScopedDataPipeConsumerHandle body,
++      std::optional<mojo_base::BigBuffer> cached_metadata) override;
++  
++  void OnReceiveRedirect(
++      const net::RedirectInfo& redirect_info,
++      mojom::URLResponseHeadPtr response_head) override;
++  
++  void OnUploadProgress(int64_t current_position,
++                        int64_t total_size,
++                        OnUploadProgressCallback callback) override;
++  
++  void OnTransferSizeUpdated(int32_t transfer_size_diff) override;
++  
++  void OnComplete(const URLLoaderCompletionStatus& status) override;
++
++ private:
++  void CaptureRequestData();
++  void CaptureResponseData(const mojom::URLResponseHead& response_head);
++  void ReadResponseBody(mojo::ScopedDataPipeConsumerHandle body);
++  void OnResponseBodyRead(const std::vector<uint8_t>& data);
++  
++  mojo::Receiver<mojom::URLLoaderClient> receiver_;
++  mojo::Remote<mojom::URLLoaderClient> forwarding_client_;
++  
++  network::ResourceRequest resource_request_;
++  base::TimeTicks start_time_;
++  
++  base::WeakPtrFactory<DataSipperUrlLoaderInterceptor> weak_factory_{this};
++};
++
++}  // namespace network
++
++#endif  // SERVICES_NETWORK_DATASIPPER_URL_LOADER_INTERCEPTOR_H_
+
+--- /dev/null
++++ b/services/network/datasipper_url_loader_interceptor.cc
+@@ -0,0 +1,120 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "services/network/datasipper_url_loader_interceptor.h"
++
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/datasipper/buildflags.h"
++
++#if BUILDFLAG(ENABLE_DATASIPPER)
++
++namespace network {
++
++DataSipperUrlLoaderInterceptor::DataSipperUrlLoaderInterceptor(
++    mojo::PendingReceiver<mojom::URLLoaderClient> client_receiver,
++    mojo::PendingRemote<mojom::URLLoaderClient> forwarding_client,
++    const network::ResourceRequest& resource_request)
++    : receiver_(this, std::move(client_receiver)),
++      forwarding_client_(std::move(forwarding_client)),
++      resource_request_(resource_request),
++      start_time_(base::TimeTicks::Now()) {
++  
++  CaptureRequestData();
++}
++
++DataSipperUrlLoaderInterceptor::~DataSipperUrlLoaderInterceptor() = default;
++
++void DataSipperUrlLoaderInterceptor::OnReceiveResponse(
++    mojom::URLResponseHeadPtr response_head,
++    mojo::ScopedDataPipeConsumerHandle body,
++    std::optional<mojo_base::BigBuffer> cached_metadata) {
++  
++  CaptureResponseData(*response_head);
++  
++  if (body.is_valid()) {
++    ReadResponseBody(std::move(body));
++  }
++  
++  forwarding_client_->OnReceiveResponse(std::move(response_head), std::move(body), std::move(cached_metadata));
++}
++
++void DataSipperUrlLoaderInterceptor::OnReceiveRedirect(
++    const net::RedirectInfo& redirect_info,
++    mojom::URLResponseHeadPtr response_head) {
++  
++  // Log redirect for DataSipper
++  VLOG(1) << "DataSipper: Redirect from " << resource_request_.url.spec() 
++          << " to " << redirect_info.new_url.spec();
++  
++  forwarding_client_->OnReceiveRedirect(redirect_info, std::move(response_head));
++}
++
++void DataSipperUrlLoaderInterceptor::OnUploadProgress(
++    int64_t current_position,
++    int64_t total_size,
++    OnUploadProgressCallback callback) {
++  forwarding_client_->OnUploadProgress(current_position, total_size, std::move(callback));
++}
++
++void DataSipperUrlLoaderInterceptor::OnTransferSizeUpdated(int32_t transfer_size_diff) {
++  forwarding_client_->OnTransferSizeUpdated(transfer_size_diff);
++}
++
++void DataSipperUrlLoaderInterceptor::OnComplete(const URLLoaderCompletionStatus& status) {
++  base::TimeDelta duration = base::TimeTicks::Now() - start_time_;
++  
++  // Log completion for DataSipper
++  VLOG(1) << "DataSipper: Request completed for " << resource_request_.url.spec()
++          << " Duration: " << duration.InMilliseconds() << "ms"
++          << " Status: " << status.error_code;
++  
++  forwarding_client_->OnComplete(status);
++}
++
++void DataSipperUrlLoaderInterceptor::CaptureRequestData() {
++  // Create request data structure for DataSipper
++  base::Value::Dict request_data;
++  request_data.Set("url", resource_request_.url.spec());
++  request_data.Set("method", resource_request_.method);
++  request_data.Set("timestamp", base::Time::Now().InMillisecondsSinceUnixEpoch());
++  
++  // Capture headers
++  base::Value::Dict headers;
++  for (const auto& header : resource_request_.headers.GetHeaderVector()) {
++    headers.Set(header.key, header.value);
++  }
++  request_data.Set("headers", std::move(headers));
++  
++  std::string json_output;
++  base::JSONWriter::Write(request_data, &json_output);
++  VLOG(1) << "DataSipper Request: " << json_output;
++}
++
++void DataSipperUrlLoaderInterceptor::CaptureResponseData(const mojom::URLResponseHead& response_head) {
++  // Create response data structure for DataSipper
++  base::Value::Dict response_data;
++  response_data.Set("url", resource_request_.url.spec());
++  response_data.Set("status_code", response_head.headers ? response_head.headers->response_code() : 0);
++  response_data.Set("timestamp", base::Time::Now().InMillisecondsSinceUnixEpoch());
++  
++  // Capture response headers
++  base::Value::Dict headers;
++  if (response_head.headers) {
++    size_t iter = 0;
++    std::string name, value;
++    while (response_head.headers->EnumerateHeaderLines(&iter, &name, &value)) {
++      headers.Set(name, value);
++    }
++  }
++  response_data.Set("headers", std::move(headers));
++  
++  std::string json_output;
++  base::JSONWriter::Write(response_data, &json_output);
++  VLOG(1) << "DataSipper Response: " << json_output;
++}
++
++void DataSipperUrlLoaderInterceptor::ReadResponseBody(mojo::ScopedDataPipeConsumerHandle body) {
++  // TODO: Implement response body reading using DataPipeReader
++  // This would capture response content for DataSipper analysis
++}
++
++void DataSipperUrlLoaderInterceptor::OnResponseBodyRead(const std::vector<uint8_t>& data) {
++  // TODO: Process captured response body data
++  VLOG(1) << "DataSipper: Captured " << data.size() << " bytes of response body";
++}
++
++}  // namespace network
++
++#endif  // BUILDFLAG(ENABLE_DATASIPPER)

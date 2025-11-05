@@ -1,0 +1,410 @@
+# DataSipper: Request/Response capture implementation
+#
+# This patch implements the detailed capture of HTTP request and response data
+# including headers, bodies, timing information, and error handling.
+#
+# Affects:
+# - services/network/datasipper_network_observer.h/cc (new files)
+# - services/network/url_loader.cc (capture hooks)
+
+--- /dev/null
++++ b/services/network/datasipper_network_observer.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
++#define SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "net/base/load_timing_info.h"
++#include "services/network/public/mojom/url_response_head.mojom-forward.h"
++#include "url/gurl.h"
++
++namespace net {
++class HttpRequestHeaders;
++class HttpResponseHeaders;
++}
++
++namespace network {
++class ResourceRequest;
++}
++
++namespace datasipper {
++struct NetworkEvent;
++}
++
++namespace network {
++
++// Observer class that captures network request/response data for DataSipper
++class DataSipperNetworkObserver {
++ public:
++  DataSipperNetworkObserver();
++  ~DataSipperNetworkObserver();
++
++  DataSipperNetworkObserver(const DataSipperNetworkObserver&) = delete;
++  DataSipperNetworkObserver& operator=(const DataSipperNetworkObserver&) = delete;
++
++  // Request lifecycle events
++  void OnRequestStarted(const ResourceRequest& request);
++  void OnRequestHeadersSet(const net::HttpRequestHeaders& headers);
++  void OnRequestBodySet(const std::string& body);
++  
++  // Response lifecycle events
++  void OnResponseStarted(const GURL& url, 
++                        const network::mojom::URLResponseHead& response_head);
++  void OnResponseBodyReceived(const std::string& data);
++  void OnResponseCompleted(const GURL& url, 
++                          int error_code,
++                          const net::LoadTimingInfo& timing_info);
++  
++  // Error handling
++  void OnRequestFailed(const GURL& url, 
++                      int error_code, 
++                      const std::string& error_message);
++
++  // Configuration
++  void SetCaptureRequestBodies(bool capture) { capture_request_bodies_ = capture; }
++  void SetCaptureResponseBodies(bool capture) { capture_response_bodies_ = capture; }
++  void SetMaxBodySize(size_t max_size) { max_body_size_ = max_size; }
++
++ private:
++  void SendNetworkEvent(std::unique_ptr<datasipper::NetworkEvent> event);
++  std::string SanitizeBodyData(const std::string& data, const std::string& content_type);
++  bool ShouldCaptureBody(const std::string& content_type, size_t body_size);
++  void ExtractTimingInfo(const net::LoadTimingInfo& timing_info, 
++                        datasipper::NetworkEvent* event);
++  
++  // Current request state
++  std::unique_ptr<datasipper::NetworkEvent> current_event_;
++  base::Time request_start_time_;
++  GURL current_url_;
++  
++  // Configuration
++  bool capture_request_bodies_ = true;
++  bool capture_response_bodies_ = true;
++  size_t max_body_size_ = 1024 * 1024;  // 1MB default
++  
++  // Response body accumulation
++  std::string response_body_buffer_;
++  
++  base::WeakPtrFactory<DataSipperNetworkObserver> weak_factory_{this};
++};
++
++}  // namespace network
++
++#endif  // SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
+--- /dev/null
++++ b/services/network/datasipper_network_observer.cc
+@@ -0,0 +1,184 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "services/network/datasipper_network_observer.h"
++
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "components/datasipper/common/network_event.h"
++#include "content/public/browser/browser_thread.h"
++#include "net/base/load_timing_info.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace network {
++
++DataSipperNetworkObserver::DataSipperNetworkObserver() = default;
++DataSipperNetworkObserver::~DataSipperNetworkObserver() = default;
++
++void DataSipperNetworkObserver::OnRequestStarted(const ResourceRequest& request) {
++  // Create new network event
++  current_event_ = std::make_unique<datasipper::NetworkEvent>();
++  current_event_->type = datasipper::NetworkEventType::HTTP_REQUEST;
++  current_event_->url = request.url;
++  current_event_->method = request.method;
++  
++  current_url_ = request.url;
++  request_start_time_ = base::Time::Now();
++  
++  // Clear response buffer
++  response_body_buffer_.clear();
++  
++  DVLOG(2) << "DataSipper: Request started for " << request.url.spec();
++}
++
++void DataSipperNetworkObserver::OnRequestHeadersSet(const net::HttpRequestHeaders& headers) {
++  if (!current_event_) {
++    return;
++  }
++  
++  // Extract request headers
++  net::HttpRequestHeaders::Iterator it(headers);
++  while (it.GetNext()) {
++    current_event_->request_headers[it.name()] = it.value();
++  }
++  
++  DVLOG(3) << "DataSipper: Captured " << current_event_->request_headers.size() 
++           << " request headers";
++}
++
++void DataSipperNetworkObserver::OnRequestBodySet(const std::string& body) {
++  if (!current_event_ || !capture_request_bodies_) {
++    return;
++  }
++  
++  // Get content type for sanitization
++  std::string content_type;
++  auto it = current_event_->request_headers.find("content-type");
++  if (it != current_event_->request_headers.end()) {
++    content_type = it->second;
++  }
++  
++  if (ShouldCaptureBody(content_type, body.size())) {
++    current_event_->request_body = SanitizeBodyData(body, content_type);
++    DVLOG(3) << "DataSipper: Captured request body (" << body.size() << " bytes)";
++  } else {
++    DVLOG(3) << "DataSipper: Skipped request body (" << body.size() << " bytes, " 
++             << content_type << ")";
++  }
++}
++
++void DataSipperNetworkObserver::OnResponseStarted(
++    const GURL& url, 
++    const network::mojom::URLResponseHead& response_head) {
++  if (!current_event_ || current_url_ != url) {
++    return;
++  }
++  
++  // Update event type
++  current_event_->type = datasipper::NetworkEventType::HTTP_RESPONSE;
++  current_event_->status_code = response_head.headers ? 
++      response_head.headers->response_code() : 0;
++  
++  // Extract response headers
++  if (response_head.headers) {
++    size_t iterator = 0;
++    std::string name, value;
++    while (response_head.headers->EnumerateHeaderLines(&iterator, &name, &value)) {
++      current_event_->response_headers[name] = value;
++    }
++  }
++  
++  DVLOG(2) << "DataSipper: Response started for " << url.spec() 
++           << " (status: " << current_event_->status_code << ")";
++}
++
++void DataSipperNetworkObserver::OnResponseBodyReceived(const std::string& data) {
++  if (!current_event_ || !capture_response_bodies_) {
++    return;
++  }
++  
++  // Accumulate response body data
++  if (response_body_buffer_.size() + data.size() <= max_body_size_) {
++    response_body_buffer_.append(data);
++  } else {
++    DVLOG(3) << "DataSipper: Response body truncated at " << max_body_size_ << " bytes";
++  }
++}
++
++void DataSipperNetworkObserver::OnResponseCompleted(
++    const GURL& url,
++    int error_code,
++    const net::LoadTimingInfo& timing_info) {
++  if (!current_event_ || current_url_ != url) {
++    return;
++  }
++  
++  // Set final response body
++  if (!response_body_buffer_.empty()) {
++    std::string content_type = current_event_->GetContentType();
++    current_event_->response_body = SanitizeBodyData(response_body_buffer_, content_type);
++  }
++  
++  // Set error information
++  current_event_->error_code = error_code;
++  
++  // Extract timing information
++  ExtractTimingInfo(timing_info, current_event_.get());
++  
++  // Calculate total time
++  current_event_->total_time = base::Time::Now() - request_start_time_;
++  
++  DVLOG(2) << "DataSipper: Request completed for " << url.spec() 
++           << " (error: " << error_code << ", time: " 
++           << current_event_->total_time.InMilliseconds() << "ms)";
++  
++  // Send the completed event
++  SendNetworkEvent(std::move(current_event_));
++}
++
++void DataSipperNetworkObserver::OnRequestFailed(
++    const GURL& url, 
++    int error_code, 
++    const std::string& error_message) {
++  if (!current_event_ || current_url_ != url) {
++    return;
++  }
++  
++  current_event_->error_code = error_code;
++  current_event_->error_message = error_message;
++  current_event_->total_time = base::Time::Now() - request_start_time_;
++  
++  DVLOG(2) << "DataSipper: Request failed for " << url.spec() 
++           << " (error: " << error_code << ")";
++  
++  SendNetworkEvent(std::move(current_event_));
++}
++
++void DataSipperNetworkObserver::SendNetworkEvent(
++    std::unique_ptr<datasipper::NetworkEvent> event) {
++  // TODO: Send event to DataSipper service
++  // This will be implemented when the service communication is available
++  DVLOG(1) << "DataSipper: Event captured for " << event->url.spec();
++}
++
++std::string DataSipperNetworkObserver::SanitizeBodyData(
++    const std::string& data, 
++    const std::string& content_type) {
++  // TODO: Implement content-specific sanitization
++  // For now, just limit size and check for binary data
++  if (data.size() > max_body_size_) {
++    return data.substr(0, max_body_size_) + "... [truncated]";
++  }
++  return data;
++}
++
++bool DataSipperNetworkObserver::ShouldCaptureBody(
++    const std::string& content_type, 
++    size_t body_size) {
++  // Skip very large bodies
++  if (body_size > max_body_size_) {
++    return false;
++  }
++  
++  // Skip binary content types
++  if (base::StartsWith(content_type, "image/", base::CompareCase::INSENSITIVE_ASCII) ||
++      base::StartsWith(content_type, "video/", base::CompareCase::INSENSITIVE_ASCII) ||
++      base::StartsWith(content_type, "audio/", base::CompareCase::INSENSITIVE_ASCII)) {
++    return false;
++  }
++  
++  return true;
++}
++
++void DataSipperNetworkObserver::ExtractTimingInfo(
++    const net::LoadTimingInfo& timing_info, 
++    datasipper::NetworkEvent* event) {
++  if (timing_info.connect_timing.dns_start.is_null()) {
++    return;
++  }
++  
++  // Extract timing phases
++  base::Time base_time = timing_info.request_start;
++  
++  if (!timing_info.connect_timing.dns_start.is_null() && 
++      !timing_info.connect_timing.dns_end.is_null()) {
++    event->dns_time = timing_info.connect_timing.dns_end - 
++                     timing_info.connect_timing.dns_start;
++  }
++  
++  if (!timing_info.connect_timing.connect_start.is_null() && 
++      !timing_info.connect_timing.connect_end.is_null()) {
++    event->connect_time = timing_info.connect_timing.connect_end - 
++                         timing_info.connect_timing.connect_start;
++  }
++  
++  if (!timing_info.connect_timing.ssl_start.is_null() && 
++      !timing_info.connect_timing.ssl_end.is_null()) {
++    event->ssl_time = timing_info.connect_timing.ssl_end - 
++                     timing_info.connect_timing.ssl_start;
++  }
++}
++
++}  // namespace network
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -649,6 +649,12 @@ void URLLoader::Start() {
+       return;
+   }
+ 
++  // Notify DataSipper observer about request start
++  if (datasipper_observer_) {
++    datasipper_observer_->OnRequestStarted(*resource_request_);
++    datasipper_observer_->OnRequestHeadersSet(resource_request_->headers);
++  }
++
+   // Resolve elements from request_body and prepare upload data.
+   if (resource_request_->request_body) {
+     OpenFilesForUpload(*resource_request_->request_body);
+@@ -1419,6 +1425,11 @@ void URLLoader::OnResponseStarted(
+     return;
+   }
+ 
++  // Notify DataSipper observer
++  if (datasipper_observer_) {
++    datasipper_observer_->OnResponseStarted(resource_request_->url, *response_head);
++  }
++
+   response_head->load_timing = url_request_->GetLoadTimingInfo();
+   response_head->raw_request_response_info = BuildRawRequestResponseInfo(
+       *url_request_, raw_request_headers_, raw_response_headers_.get());
+@@ -1611,6 +1622,11 @@ void URLLoader::OnReadCompleted(net::URLRequest* url_request, int bytes_read) {
+   }
+ 
+   if (bytes_read > 0) {
++    // Notify DataSipper observer about response body data
++    if (datasipper_observer_) {
++      datasipper_observer_->OnResponseBodyReceived(
++          std::string(read_buffer_->data(), bytes_read));
++    }
+     DidRead(bytes_read, false);
+     // Continue reading.
+     ReadMore();
+@@ -1625,6 +1641,12 @@ void URLLoader::OnReadCompleted(net::URLRequest* url_request, int bytes_read) {
+ void URLLoader::DidFinishLoading() {
+   DCHECK(url_request_->status().is_success());
+ 
++  // Notify DataSipper observer about completion
++  if (datasipper_observer_) {
++    datasipper_observer_->OnResponseCompleted(
++        resource_request_->url, net::OK, url_request_->GetLoadTimingInfo());
++  }
++
+   const net::LoadTimingInfo& timing_info = url_request_->GetLoadTimingInfo();
+   base::TimeTicks response_complete_time = timing_info.receive_headers_end;
+   if (response_complete_time.is_null())
+@@ -1647,6 +1669,12 @@ void URLLoader::DidFinishLoading() {
+ void URLLoader::DidFailLoading(int error_code) {
+   DCHECK_NE(net::OK, error_code);
+ 
++  // Notify DataSipper observer about failure
++  if (datasipper_observer_) {
++    datasipper_observer_->OnRequestFailed(
++        resource_request_->url, error_code, url_request_->status().ToNetErrorString());
++  }
++
+   const net::LoadTimingInfo& timing_info = url_request_->GetLoadTimingInfo();
+   base::TimeTicks failed_time = timing_info.receive_headers_end;
+   if (failed_time.is_null())
+@@ -1907,6 +1935,13 @@ void URLLoader::SetUpUpload() {
+   if (resource_request_->request_body) {
+     url_request_->set_upload(CreateUploadDataStream(
+         resource_request_->request_body.get(), blob_context_.get()));
++    
++    // Notify DataSipper observer about request body
++    if (datasipper_observer_ && resource_request_->request_body) {
++      // TODO: Extract actual body data from upload stream
++      // For now, just note that there is a body
++      datasipper_observer_->OnRequestBodySet("[request body data]");
++    }
+   }
+ }
+ 

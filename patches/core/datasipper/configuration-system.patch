@@ -1,0 +1,193 @@
+# DataSipper: Configuration system and preferences
+#
+# This patch adds DataSipper-specific configuration management including:
+# - Browser preferences for DataSipper settings
+# - Runtime configuration management
+# - Feature flag integration
+#
+# Affects:
+# - chrome/browser/prefs/browser_prefs.cc
+# - chrome/common/pref_names.cc/h
+# - components/datasipper/browser/datasipper_prefs.cc/h
+
+--- /dev/null
++++ b/components/datasipper/browser/datasipper_prefs.h
+@@ -0,0 +1,47 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_BROWSER_DATASIPPER_PREFS_H_
++#define COMPONENTS_DATASIPPER_BROWSER_DATASIPPER_PREFS_H_
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace datasipper {
++namespace prefs {
++
++// DataSipper preference names
++extern const char kDataSipperEnabled[];
++extern const char kDataSipperNetworkInterceptionEnabled[];
++extern const char kDataSipperUIEnabled[];
++extern const char kDataSipperMaxEventBufferSize[];
++extern const char kDataSipperDataRetentionDays[];
++extern const char kDataSipperCaptureRequestBodies[];
++extern const char kDataSipperCaptureResponseBodies[];
++extern const char kDataSipperExternalIntegrationsEnabled[];
++
++// Stream configuration preferences
++extern const char kDataSipperStreamRules[];
++extern const char kDataSipperActiveStreams[];
++extern const char kDataSipperDefaultGroup[];
++
++// Output configuration preferences
++extern const char kDataSipperKafkaConfig[];
++extern const char kDataSipperRedisConfig[];
++extern const char kDataSipperMySQLConfig[];
++extern const char kDataSipperWebhookConfig[];
++
++// Register DataSipper preferences
++void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++// Helper functions for accessing preferences
++bool IsDataSipperEnabled(PrefService* prefs);
++bool IsNetworkInterceptionEnabled(PrefService* prefs);
++int GetMaxEventBufferSize(PrefService* prefs);
++int GetDataRetentionDays(PrefService* prefs);
++
++}  // namespace prefs
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_BROWSER_DATASIPPER_PREFS_H_
+--- /dev/null
++++ b/components/datasipper/browser/datasipper_prefs.cc
+@@ -0,0 +1,98 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/browser/datasipper_prefs.h"
++
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace datasipper {
++namespace prefs {
++
++// DataSipper preference names
++const char kDataSipperEnabled[] = "datasipper.enabled";
++const char kDataSipperNetworkInterceptionEnabled[] = "datasipper.network_interception_enabled";
++const char kDataSipperUIEnabled[] = "datasipper.ui_enabled";
++const char kDataSipperMaxEventBufferSize[] = "datasipper.max_event_buffer_size";
++const char kDataSipperDataRetentionDays[] = "datasipper.data_retention_days";
++const char kDataSipperCaptureRequestBodies[] = "datasipper.capture_request_bodies";
++const char kDataSipperCaptureResponseBodies[] = "datasipper.capture_response_bodies";
++const char kDataSipperExternalIntegrationsEnabled[] = "datasipper.external_integrations_enabled";
++
++// Stream configuration preferences
++const char kDataSipperStreamRules[] = "datasipper.stream_rules";
++const char kDataSipperActiveStreams[] = "datasipper.active_streams";
++const char kDataSipperDefaultGroup[] = "datasipper.default_group";
++
++// Output configuration preferences
++const char kDataSipperKafkaConfig[] = "datasipper.kafka_config";
++const char kDataSipperRedisConfig[] = "datasipper.redis_config";
++const char kDataSipperMySQLConfig[] = "datasipper.mysql_config";
++const char kDataSipperWebhookConfig[] = "datasipper.webhook_config";
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  // Core DataSipper preferences
++  registry->RegisterBooleanPref(kDataSipperEnabled, true);
++  registry->RegisterBooleanPref(kDataSipperNetworkInterceptionEnabled, true);
++  registry->RegisterBooleanPref(kDataSipperUIEnabled, true);
++  
++  // Buffer and retention settings
++  registry->RegisterIntegerPref(kDataSipperMaxEventBufferSize, 10000);
++  registry->RegisterIntegerPref(kDataSipperDataRetentionDays, 7);
++  
++  // Data capture settings
++  registry->RegisterBooleanPref(kDataSipperCaptureRequestBodies, true);
++  registry->RegisterBooleanPref(kDataSipperCaptureResponseBodies, true);
++  
++  // External integrations
++  registry->RegisterBooleanPref(kDataSipperExternalIntegrationsEnabled, false);
++  
++  // Stream configuration (stored as JSON)
++  registry->RegisterListPref(kDataSipperStreamRules);
++  registry->RegisterListPref(kDataSipperActiveStreams);
++  registry->RegisterStringPref(kDataSipperDefaultGroup, "default");
++  
++  // Output configurations (stored as JSON dictionaries)
++  registry->RegisterDictionaryPref(kDataSipperKafkaConfig);
++  registry->RegisterDictionaryPref(kDataSipperRedisConfig);
++  registry->RegisterDictionaryPref(kDataSipperMySQLConfig);
++  registry->RegisterDictionaryPref(kDataSipperWebhookConfig);
++}
++
++bool IsDataSipperEnabled(PrefService* prefs) {
++  return prefs->GetBoolean(kDataSipperEnabled);
++}
++
++bool IsNetworkInterceptionEnabled(PrefService* prefs) {
++  return prefs->GetBoolean(kDataSipperNetworkInterceptionEnabled);
++}
++
++int GetMaxEventBufferSize(PrefService* prefs) {
++  return prefs->GetInteger(kDataSipperMaxEventBufferSize);
++}
++
++int GetDataRetentionDays(PrefService* prefs) {
++  return prefs->GetInteger(kDataSipperDataRetentionDays);
++}
++
++}  // namespace prefs
++}  // namespace datasipper
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -128,6 +128,7 @@
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/custom_handlers/protocol_handler_registry.h"
+ #include "components/data_reduction_proxy/core/browser/data_reduction_proxy_prefs.h"
++#include "components/datasipper/browser/datasipper_prefs.h"
+ #include "components/dom_distiller/core/distilled_page_prefs.h"
+ #include "components/download/public/common/download_prefs.h"
+ #include "components/enterprise/browser/controller/browser_dm_token_storage.h"
+@@ -1076,6 +1077,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
+   DefaultSearchManager::RegisterProfilePrefs(registry);
+   DelayedWarningHandler::RegisterProfilePrefs(registry);
+   DeviceOAuth2TokenService::RegisterProfilePrefs(registry);
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  datasipper::prefs::RegisterProfilePrefs(registry);
++#endif
+   DownloadPrefs::RegisterProfilePrefs(registry);
+   HostContentSettingsMap::RegisterProfilePrefs(registry);
+   HttpsOnlyModeTabHelper::RegisterProfilePrefs(registry);
+--- a/chrome/common/pref_names.cc
++++ b/chrome/common/pref_names.cc
+@@ -2720,6 +2720,11 @@ const char kDialMediaRouteProviderEnabled[] =
+ const char kAccessCodeCastDeviceDuration[] =
+     "media_router.access_code_cast_device_duration";
+ 
++// DataSipper
++const char kDataSipperEnabled[] = "datasipper.enabled";
++const char kDataSipperPanelOpen[] = "datasipper.panel_open";
++const char kDataSipperLastViewedTab[] = "datasipper.last_viewed_tab";
++
+ }  // namespace prefs
+ 
+ // Deprecated 04/2023
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -1007,6 +1007,10 @@ COMPONENT_EXPORT(CHROME_FEATURES) extern const char kDialMediaRouteProviderEna
+ COMPONENT_EXPORT(CHROME_FEATURES)
+ extern const char kAccessCodeCastDeviceDuration[];
+ 
++// DataSipper preferences
++COMPONENT_EXPORT(CHROME_FEATURES) extern const char kDataSipperEnabled[];
++COMPONENT_EXPORT(CHROME_FEATURES) extern const char kDataSipperPanelOpen[];
++COMPONENT_EXPORT(CHROME_FEATURES) extern const char kDataSipperLastViewedTab[];
++
+ }  // namespace prefs
+ 
+ #endif  // CHROME_COMMON_PREF_NAMES_H_

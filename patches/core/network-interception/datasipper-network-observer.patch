@@ -1,0 +1,313 @@
+# DataSipper: Network observer implementation
+#
+# This patch adds the DataSipperNetworkObserver class that handles
+# the actual capture and processing of network requests and responses.
+#
+# Affects:
+# - services/network/datasipper_network_observer.h (new file)
+# - services/network/datasipper_network_observer.cc (new file)
+# - services/network/BUILD.gn
+
+--- /dev/null
++++ b/services/network/datasipper_network_observer.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
++#define SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "net/base/request_priority.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace net {
++class URLRequest;
++}
++
++namespace network {
++
++// Observer class that captures and processes network requests and responses
++// for the DataSipper monitoring panel.
++class DataSipperNetworkObserver {
++ public:
++  DataSipperNetworkObserver();
++  ~DataSipperNetworkObserver();
++
++  DataSipperNetworkObserver(const DataSipperNetworkObserver&) = delete;
++  DataSipperNetworkObserver& operator=(const DataSipperNetworkObserver&) = delete;
++
++  // Network event callbacks
++  void OnRequestStarted(const net::URLRequest* request);
++  void OnRequestPriorityChanged(const net::URLRequest* request, 
++                               net::RequestPriority priority);
++  void OnResponseStarted(const net::URLRequest* request,
++                        const mojom::URLResponseHead* response_head);
++  void OnBeforeRead(const net::URLRequest* request, int buffer_size);
++  void OnDataRead(const net::URLRequest* request, 
++                 const char* data, 
++                 int bytes_read);
++  void OnReadCompleted(const net::URLRequest* request, int bytes_read);
++  void OnResponseCompleted(const net::URLRequest* request, int error_code);
++
++ private:
++  struct RequestInfo {
++    std::string url;
++    std::string method;
++    base::Time start_time;
++    net::RequestPriority priority;
++    std::string request_headers;
++    std::string request_body;
++    
++    // Response data
++    int response_code = 0;
++    std::string response_headers;
++    std::string response_body;
++    base::Time response_start_time;
++    base::Time completion_time;
++    int error_code = 0;
++    int64_t total_bytes_read = 0;
++  };
++
++  // Helper methods
++  void CaptureRequestHeaders(const net::URLRequest* request, RequestInfo* info);
++  void CaptureRequestBody(const net::URLRequest* request, RequestInfo* info);
++  void CaptureResponseHeaders(const mojom::URLResponseHead* response_head, 
++                             RequestInfo* info);
++  void ProcessCompletedRequest(std::unique_ptr<RequestInfo> info);
++  void SendToDataSipperPanel(const RequestInfo& info);
++  void StoreInDatabase(const RequestInfo& info);
++
++  // Request tracking
++  std::map<const net::URLRequest*, std::unique_ptr<RequestInfo>> active_requests_;
++  
++  // Configuration
++  bool capture_request_body_ = true;
++  bool capture_response_body_ = true;
++  size_t max_body_size_ = 1024 * 1024;  // 1MB max
++  
++  base::WeakPtrFactory<DataSipperNetworkObserver> weak_factory_{this};
++};
++
++}  // namespace network
++
++#endif  // SERVICES_NETWORK_DATASIPPER_NETWORK_OBSERVER_H_
+--- /dev/null
++++ b/services/network/datasipper_network_observer.cc
+@@ -0,0 +1,203 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "services/network/datasipper_network_observer.h"
++
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "net/base/upload_data_stream.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_response_headers.h"
++#include "net/url_request/url_request.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace network {
++
++DataSipperNetworkObserver::DataSipperNetworkObserver() {
++  DVLOG(1) << "DataSipper network observer initialized";
++}
++
++DataSipperNetworkObserver::~DataSipperNetworkObserver() {
++  DVLOG(1) << "DataSipper network observer destroyed";
++}
++
++void DataSipperNetworkObserver::OnRequestStarted(const net::URLRequest* request) {
++  if (!request) return;
++  
++  auto info = std::make_unique<RequestInfo>();
++  info->url = request->url().spec();
++  info->method = request->method();
++  info->start_time = base::Time::Now();
++  info->priority = request->priority();
++  
++  CaptureRequestHeaders(request, info.get());
++  CaptureRequestBody(request, info.get());
++  
++  active_requests_[request] = std::move(info);
++  
++  DVLOG(2) << "DataSipper: Request started - " << request->method() 
++           << " " << request->url().spec();
++}
++
++void DataSipperNetworkObserver::OnRequestPriorityChanged(
++    const net::URLRequest* request, 
++    net::RequestPriority priority) {
++  auto it = active_requests_.find(request);
++  if (it != active_requests_.end()) {
++    it->second->priority = priority;
++    DVLOG(3) << "DataSipper: Priority changed for " << request->url().spec();
++  }
++}
++
++void DataSipperNetworkObserver::OnResponseStarted(
++    const net::URLRequest* request,
++    const mojom::URLResponseHead* response_head) {
++  auto it = active_requests_.find(request);
++  if (it == active_requests_.end()) {
++    // If we didn't catch the request start, create an entry now
++    OnRequestStarted(request);
++    it = active_requests_.find(request);
++  }
++  
++  if (it != active_requests_.end() && response_head) {
++    RequestInfo* info = it->second.get();
++    info->response_start_time = base::Time::Now();
++    info->response_code = response_head->headers ? 
++        response_head->headers->response_code() : 0;
++    
++    CaptureResponseHeaders(response_head, info);
++    
++    DVLOG(2) << "DataSipper: Response started - " << info->response_code 
++             << " for " << request->url().spec();
++  }
++}
++
++void DataSipperNetworkObserver::OnBeforeRead(const net::URLRequest* request, 
++                                           int buffer_size) {
++  DVLOG(3) << "DataSipper: Before read " << buffer_size << " bytes for " 
++           << request->url().spec();
++}
++
++void DataSipperNetworkObserver::OnDataRead(const net::URLRequest* request, 
++                                         const char* data, 
++                                         int bytes_read) {
++  auto it = active_requests_.find(request);
++  if (it != active_requests_.end() && capture_response_body_ && data && bytes_read > 0) {
++    RequestInfo* info = it->second.get();
++    
++    // Limit response body size to prevent memory issues
++    if (info->response_body.size() + bytes_read <= max_body_size_) {
++      info->response_body.append(data, bytes_read);
++    }
++    
++    info->total_bytes_read += bytes_read;
++    
++    DVLOG(3) << "DataSipper: Read " << bytes_read << " bytes for " 
++             << request->url().spec();
++  }
++}
++
++void DataSipperNetworkObserver::OnReadCompleted(const net::URLRequest* request, 
++                                              int bytes_read) {
++  DVLOG(3) << "DataSipper: Read completed " << bytes_read << " bytes for " 
++           << request->url().spec();
++}
++
++void DataSipperNetworkObserver::OnResponseCompleted(const net::URLRequest* request, 
++                                                  int error_code) {
++  auto it = active_requests_.find(request);
++  if (it != active_requests_.end()) {
++    RequestInfo* info = it->second.get();
++    info->completion_time = base::Time::Now();
++    info->error_code = error_code;
++    
++    DVLOG(2) << "DataSipper: Request completed - " << error_code 
++             << " for " << request->url().spec();
++    
++    // Process the completed request
++    ProcessCompletedRequest(std::move(it->second));
++    active_requests_.erase(it);
++  }
++}
++
++void DataSipperNetworkObserver::CaptureRequestHeaders(const net::URLRequest* request,
++                                                    RequestInfo* info) {
++  if (!request || !info) return;
++  
++  const net::HttpRequestHeaders& headers = request->extra_request_headers();
++  std::string headers_string;
++  
++  net::HttpRequestHeaders::Iterator it(headers);
++  while (it.GetNext()) {
++    headers_string += it.name() + ": " + it.value() + "\n";
++  }
++  
++  info->request_headers = headers_string;
++}
++
++void DataSipperNetworkObserver::CaptureRequestBody(const net::URLRequest* request,
++                                                 RequestInfo* info) {
++  if (!request || !info || !capture_request_body_) return;
++  
++  const net::UploadDataStream* upload_stream = request->get_upload();
++  if (!upload_stream) return;
++  
++  // TODO: Implement request body capture
++  // This requires reading from the upload data stream, which may be complex
++  // for different upload types (bytes, files, etc.)
++  info->request_body = "[Request body capture not yet implemented]";
++}
++
++void DataSipperNetworkObserver::CaptureResponseHeaders(
++    const mojom::URLResponseHead* response_head,
++    RequestInfo* info) {
++  if (!response_head || !response_head->headers || !info) return;
++  
++  std::string headers_string;
++  size_t iter = 0;
++  std::string name, value;
++  
++  while (response_head->headers->EnumerateHeaderLines(&iter, &name, &value)) {
++    headers_string += name + ": " + value + "\n";
++  }
++  
++  info->response_headers = headers_string;
++}
++
++void DataSipperNetworkObserver::ProcessCompletedRequest(
++    std::unique_ptr<RequestInfo> info) {
++  if (!info) return;
++  
++  // Send to DataSipper panel for real-time display
++  SendToDataSipperPanel(*info);
++  
++  // Store in database for persistence
++  StoreInDatabase(*info);
++}
++
++void DataSipperNetworkObserver::SendToDataSipperPanel(const RequestInfo& info) {
++  // TODO: Implement sending data to DataSipper UI panel
++  // This will involve IPC communication to send data to the browser process
++  // and then to the JavaScript UI panel
++  
++  DVLOG(1) << "DataSipper: Sending to panel - " << info.method 
++           << " " << info.url << " (" << info.response_code << ")";
++}
++
++void DataSipperNetworkObserver::StoreInDatabase(const RequestInfo& info) {
++  // TODO: Implement database storage
++  // This will involve storing the request/response data in SQLite
++  // for historical viewing and analysis
++  
++  DVLOG(1) << "DataSipper: Storing in DB - " << info.method 
++           << " " << info.url << " (" << info.response_code << ")";
++}
++
++}  // namespace network
+--- a/services/network/BUILD.gn
++++ b/services/network/BUILD.gn
+@@ -150,6 +150,8 @@ component("network_service") {
+     "cross_origin_read_blocking.h",
+     "custom_proxy_config_monitor.cc",
+     "custom_proxy_config_monitor.h",
++    "datasipper_network_observer.cc",
++    "datasipper_network_observer.h",
+     "disk_cache/mojo_backend_file_operations.cc",
+     "disk_cache/mojo_backend_file_operations.h",
+     "disk_cache/mojo_backend_file_operations_factory.cc",

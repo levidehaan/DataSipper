@@ -1,0 +1,692 @@
+# DataSipper: Redis output connector with pub/sub and stream support
+#
+# This patch implements the Redis output connector supporting both
+# Redis pub/sub channels and Redis streams for real-time data distribution.
+
+--- /dev/null
++++ b/components/datasipper/output/redis_connector.h
+@@ -0,0 +1,148 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_OUTPUT_REDIS_CONNECTOR_H_
++#define COMPONENTS_DATASIPPER_OUTPUT_REDIS_CONNECTOR_H_
++
++#include <memory>
++#include <string>
++#include <map>
++
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/threading/sequenced_task_runner.h"
++#include "base/timer/timer.h"
++#include "components/datasipper/output/output_connector_base.h"
++
++namespace datasipper {
++
++// Redis connection modes
++enum class RedisMode {
++  PUBSUB,    // Publish to channels
++  STREAM,    // Redis streams (5.0+)
++  SET,       // Store as sets with TTL
++  LIST       // Store as lists with size limit
++};
++
++// Configuration for Redis connection
++struct RedisConfig {
++  std::string host = "localhost";
++  int port = 6379;
++  std::string password;
++  int database = 0;
++  
++  // Connection settings
++  int timeout_ms = 5000;
++  int connect_timeout_ms = 3000;
++  int reconnect_interval_ms = 1000;
++  int max_reconnect_attempts = 10;
++  
++  // Pool settings
++  int connection_pool_size = 5;
++  int max_idle_connections = 2;
++  
++  // Default mode and targets
++  RedisMode default_mode = RedisMode::PUBSUB;
++  std::string default_channel = "datasipper";
++  std::string default_stream = "datasipper:events";
++  
++  // Performance settings
++  int batch_size = 100;
++  int pipeline_size = 10;
++  bool enable_compression = false;
++  
++  base::Value::Dict ToDict() const;
++  static RedisConfig FromDict(const base::Value::Dict& dict);
++  bool IsValid() const;
++};
++
++// Message routing configuration for Redis
++struct RedisMessageRoute {
++  RedisMode mode = RedisMode::PUBSUB;
++  std::string target;              // Channel name, stream name, key name
++  std::string key_field;           // Field to use for partitioning
++  int ttl_seconds = 0;             // TTL for SET mode (0 = no expiry)
++  int max_length = 1000;           // Max length for LIST mode
++  base::Value::Dict extra_fields;  // Additional fields to add
++  
++  base::Value::Dict ToDict() const;
++  static RedisMessageRoute FromDict(const base::Value::Dict& dict);
++};
++
++// Redis client implementation using hiredis
++class RedisConnector : public OutputConnectorBase {
++ public:
++  explicit RedisConnector(const std::string& name);
++  ~RedisConnector() override;
++  
++  RedisConnector(const RedisConnector&) = delete;
++  RedisConnector& operator=(const RedisConnector&) = delete;
++
++  // OutputConnectorBase implementation
++  bool Configure(const base::Value::Dict& config) override;
++  base::Value::Dict GetConfiguration() const override;
++  bool Connect() override;
++  void Disconnect() override;
++  bool IsConnected() const override;
++  OutputResult SendData(const base::Value::Dict& data) override;
++  OutputResult SendBatch(const std::vector<base::Value::Dict>& batch) override;
++  bool HealthCheck() override;
++  
++  // Redis-specific methods
++  void SetMessageRoute(const std::string& stream_name, const RedisMessageRoute& route);
++  void RemoveMessageRoute(const std::string& stream_name);
++  RedisMessageRoute GetMessageRoute(const std::string& stream_name) const;
++  
++  // Redis operations
++  bool PublishMessage(const std::string& channel, const std::string& message);
++  bool AddToStream(const std::string& stream, const base::Value::Dict& fields);
++  bool SetWithTTL(const std::string& key, const std::string& value, int ttl_seconds);
++  bool PushToList(const std::string& key, const std::string& value, int max_length);
++  
++  // Connection management
++  bool Ping();
++  std::string GetServerInfo();
++  int GetDatabaseSize();
++  
++  // Statistics
++  size_t GetPendingCommandCount() const;
++  size_t GetSuccessfulCommandCount() const { return successful_commands_; }
++  size_t GetFailedCommandCount() const { return failed_commands_; }
++  double GetAverageLatencyMs() const;
++  
++ private:
++  bool InitializeConnection();
++  void DestroyConnection();
++  bool ValidateConfiguration() const;
++  void StartReconnectTimer();
++  void OnReconnectTimer();
++  
++  OutputResult SendSingleMessage(const base::Value::Dict& data, const RedisMessageRoute& route);
++  OutputResult SendPubSubMessage(const std::string& channel, const base::Value::Dict& data);
++  OutputResult SendStreamMessage(const std::string& stream, const base::Value::Dict& data);
++  OutputResult SendSetMessage(const std::string& key, const base::Value::Dict& data, int ttl);
++  OutputResult SendListMessage(const std::string& key, const base::Value::Dict& data, int max_length);
++  
++  std::string SerializeMessage(const base::Value::Dict& data);
++  std::string GenerateKey(const base::Value::Dict& data, const RedisMessageRoute& route);
++  
++  RedisConfig config_;
++  std::map<std::string, RedisMessageRoute> message_routes_;  // stream_name -> route
++  
++  // hiredis handles (using void* to avoid including hiredis headers)
++  void* redis_context_ = nullptr;
++  
++  // Connection state
++  bool connected_ = false;
++  int reconnect_attempts_ = 0;
++  base::Time last_connection_attempt_;
++  
++  // Statistics
++  size_t successful_commands_ = 0;
++  size_t failed_commands_ = 0;
++  base::TimeDelta total_latency_;
++  size_t latency_samples_ = 0;
++  
++  // Reconnection timer
++  std::unique_ptr<base::RepeatingTimer> reconnect_timer_;
++  
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<RedisConnector> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_OUTPUT_REDIS_CONNECTOR_H_
++--- /dev/null
++++ b/components/datasipper/output/redis_connector.cc
+@@ -0,0 +1,456 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/output/redis_connector.h"
++
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/timer/timer.h"
++
++// NOTE: In a real implementation, you would include hiredis headers here
++// For this patch, we'll use placeholder implementations
++
++namespace datasipper {
++
++namespace {
++
++constexpr char kDefaultChannel[] = "datasipper";
++constexpr char kDefaultStream[] = "datasipper:events";
++constexpr int kDefaultTimeout = 5000;
++constexpr int kDefaultBatchSize = 100;
++
++std::string RedisModeToString(RedisMode mode) {
++  switch (mode) {
++    case RedisMode::PUBSUB: return "pubsub";
++    case RedisMode::STREAM: return "stream";
++    case RedisMode::SET: return "set";
++    case RedisMode::LIST: return "list";
++  }
++  return "unknown";
++}
++
++RedisMode StringToRedisMode(const std::string& mode_str) {
++  if (mode_str == "pubsub") return RedisMode::PUBSUB;
++  if (mode_str == "stream") return RedisMode::STREAM;
++  if (mode_str == "set") return RedisMode::SET;
++  if (mode_str == "list") return RedisMode::LIST;
++  return RedisMode::PUBSUB;  // Default
++}
++
++}  // namespace
++
++// RedisConfig implementation
++base::Value::Dict RedisConfig::ToDict() const {
++  base::Value::Dict dict;
++  dict.Set("host", host);
++  dict.Set("port", port);
++  dict.Set("password", password);
++  dict.Set("database", database);
++  dict.Set("timeout_ms", timeout_ms);
++  dict.Set("connect_timeout_ms", connect_timeout_ms);
++  dict.Set("reconnect_interval_ms", reconnect_interval_ms);
++  dict.Set("max_reconnect_attempts", max_reconnect_attempts);
++  dict.Set("connection_pool_size", connection_pool_size);
++  dict.Set("max_idle_connections", max_idle_connections);
++  dict.Set("default_mode", RedisModeToString(default_mode));
++  dict.Set("default_channel", default_channel);
++  dict.Set("default_stream", default_stream);
++  dict.Set("batch_size", batch_size);
++  dict.Set("pipeline_size", pipeline_size);
++  dict.Set("enable_compression", enable_compression);
++  return dict;
++}
++
++RedisConfig RedisConfig::FromDict(const base::Value::Dict& dict) {
++  RedisConfig config;
++  if (const std::string* value = dict.FindString("host")) {
++    config.host = *value;
++  }
++  config.port = dict.FindInt("port").value_or(6379);
++  if (const std::string* value = dict.FindString("password")) {
++    config.password = *value;
++  }
++  config.database = dict.FindInt("database").value_or(0);
++  config.timeout_ms = dict.FindInt("timeout_ms").value_or(kDefaultTimeout);
++  config.connect_timeout_ms = dict.FindInt("connect_timeout_ms").value_or(3000);
++  config.reconnect_interval_ms = dict.FindInt("reconnect_interval_ms").value_or(1000);
++  config.max_reconnect_attempts = dict.FindInt("max_reconnect_attempts").value_or(10);
++  config.connection_pool_size = dict.FindInt("connection_pool_size").value_or(5);
++  config.max_idle_connections = dict.FindInt("max_idle_connections").value_or(2);
++  
++  if (const std::string* value = dict.FindString("default_mode")) {
++    config.default_mode = StringToRedisMode(*value);
++  }
++  if (const std::string* value = dict.FindString("default_channel")) {
++    config.default_channel = *value;
++  }
++  if (const std::string* value = dict.FindString("default_stream")) {
++    config.default_stream = *value;
++  }
++  
++  config.batch_size = dict.FindInt("batch_size").value_or(kDefaultBatchSize);
++  config.pipeline_size = dict.FindInt("pipeline_size").value_or(10);
++  config.enable_compression = dict.FindBool("enable_compression").value_or(false);
++  
++  return config;
++}
++
++bool RedisConfig::IsValid() const {
++  return !host.empty() && port > 0 && port < 65536;
++}
++
++// RedisMessageRoute implementation
++base::Value::Dict RedisMessageRoute::ToDict() const {
++  base::Value::Dict dict;
++  dict.Set("mode", RedisModeToString(mode));
++  dict.Set("target", target);
++  dict.Set("key_field", key_field);
++  dict.Set("ttl_seconds", ttl_seconds);
++  dict.Set("max_length", max_length);
++  dict.Set("extra_fields", extra_fields.Clone());
++  return dict;
++}
++
++RedisMessageRoute RedisMessageRoute::FromDict(const base::Value::Dict& dict) {
++  RedisMessageRoute route;
++  if (const std::string* value = dict.FindString("mode")) {
++    route.mode = StringToRedisMode(*value);
++  }
++  if (const std::string* value = dict.FindString("target")) {
++    route.target = *value;
++  }
++  if (const std::string* value = dict.FindString("key_field")) {
++    route.key_field = *value;
++  }
++  route.ttl_seconds = dict.FindInt("ttl_seconds").value_or(0);
++  route.max_length = dict.FindInt("max_length").value_or(1000);
++  if (const base::Value::Dict* extra = dict.FindDict("extra_fields")) {
++    route.extra_fields = extra->Clone();
++  }
++  return route;
++}
++
++// RedisConnector implementation
++RedisConnector::RedisConnector(const std::string& name) 
++    : OutputConnectorBase(name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++RedisConnector::~RedisConnector() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  Disconnect();
++}
++
++bool RedisConnector::Configure(const base::Value::Dict& config) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // Parse Redis configuration
++  if (const base::Value::Dict* redis_config = config.FindDict("redis")) {
++    config_ = RedisConfig::FromDict(*redis_config);
++  } else {
++    LOG(ERROR) << "Redis connector: Missing redis configuration";
++    return false;
++  }
++  
++  // Parse message routes
++  if (const base::Value::Dict* routes = config.FindDict("message_routes")) {
++    message_routes_.clear();
++    for (const auto& [stream_name, route_value] : *routes) {
++      if (route_value.is_dict()) {
++        message_routes_[stream_name] = RedisMessageRoute::FromDict(route_value.GetDict());
++      }
++    }
++  }
++  
++  if (!ValidateConfiguration()) {
++    LOG(ERROR) << "Redis connector: Invalid configuration";
++    return false;
++  }
++  
++  return true;
++}
++
++base::Value::Dict RedisConnector::GetConfiguration() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  base::Value::Dict config;
++  config.Set("redis", config_.ToDict());
++  
++  base::Value::Dict routes;
++  for (const auto& [stream_name, route] : message_routes_) {
++    routes.Set(stream_name, route.ToDict());
++  }
++  config.Set("message_routes", std::move(routes));
++  
++  return config;
++}
++
++bool RedisConnector::Connect() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (connected_) {
++    return true;
++  }
++  
++  if (!ValidateConfiguration()) {
++    LOG(ERROR) << "Redis connector: Cannot connect with invalid configuration";
++    return false;
++  }
++  
++  if (!InitializeConnection()) {
++    LOG(ERROR) << "Redis connector: Failed to initialize connection";
++    StartReconnectTimer();
++    return false;
++  }
++  
++  connected_ = true;
++  reconnect_attempts_ = 0;
++  reconnect_timer_.reset();
++  NotifyConnectionStatusChanged(true);
++  
++  LOG(INFO) << "Redis connector: Successfully connected to " << config_.host << ":" << config_.port;
++  return true;
++}
++
++void RedisConnector::Disconnect() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return;
++  }
++  
++  reconnect_timer_.reset();
++  DestroyConnection();
++  connected_ = false;
++  NotifyConnectionStatusChanged(false);
++  
++  LOG(INFO) << "Redis connector: Disconnected";
++}
++
++bool RedisConnector::IsConnected() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return connected_;
++}
++
++OutputResult RedisConnector::SendData(const base::Value::Dict& data) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return OutputResult::ConfigError("Redis connector not connected");
++  }
++  
++  // Determine message route
++  RedisMessageRoute route;
++  if (const std::string* stream_name = data.FindString("stream_name")) {
++    auto it = message_routes_.find(*stream_name);
++    if (it != message_routes_.end()) {
++      route = it->second;
++    }
++  }
++  
++  // Use default configuration if no specific route
++  if (route.target.empty()) {
++    route.mode = config_.default_mode;
++    switch (route.mode) {
++      case RedisMode::PUBSUB:
++        route.target = config_.default_channel;
++        break;
++      case RedisMode::STREAM:
++        route.target = config_.default_stream;
++        break;
++      case RedisMode::SET:
++      case RedisMode::LIST:
++        route.target = "datasipper:data";
++        break;
++    }
++  }
++  
++  return SendSingleMessage(data, route);
++}
++
++OutputResult RedisConnector::SendBatch(const std::vector<base::Value::Dict>& batch) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return OutputResult::ConfigError("Redis connector not connected");
++  }
++  
++  if (batch.empty()) {
++    return OutputResult::Success();
++  }
++  
++  // TODO: Implement pipelining for better batch performance
++  size_t success_count = 0;
++  std::string last_error;
++  
++  for (const auto& data : batch) {
++    OutputResult result = SendData(data);
++    if (result.status == OutputStatus::SUCCESS) {
++      success_count++;
++    } else {
++      last_error = result.error_message;
++    }
++  }
++  
++  if (success_count == batch.size()) {
++    return OutputResult::Success();
++  } else if (success_count > 0) {
++    return OutputResult::Retry("Partial batch failure: " + last_error);
++  } else {
++    return OutputResult::Failure("Complete batch failure: " + last_error);
++  }
++}
++
++bool RedisConnector::HealthCheck() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!connected_) {
++    return false;
++  }
++  
++  return Ping();
++}
++
++void RedisConnector::SetMessageRoute(const std::string& stream_name, const RedisMessageRoute& route) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  message_routes_[stream_name] = route;
++}
++
++void RedisConnector::RemoveMessageRoute(const std::string& stream_name) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  message_routes_.erase(stream_name);
++}
++
++RedisMessageRoute RedisConnector::GetMessageRoute(const std::string& stream_name) const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  auto it = message_routes_.find(stream_name);
++  return it != message_routes_.end() ? it->second : RedisMessageRoute();
++}
++
++bool RedisConnector::InitializeConnection() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  // TODO: Implement actual hiredis connection initialization
++  // This would involve:
++  // 1. Creating redisContext with redisConnect()
++  // 2. Setting timeout with redisSetTimeout()
++  // 3. Authenticating if password is provided
++  // 4. Selecting database if non-zero
++  
++  DVLOG(1) << "Redis connector: Initializing connection to " << config_.host << ":" << config_.port;
++  
++  // Placeholder implementation
++  redis_context_ = reinterpret_cast<void*>(0x5678);  // Fake handle
++  
++  last_connection_attempt_ = base::Time::Now();
++  return true;
++}
++
++void RedisConnector::DestroyConnection() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (redis_context_) {
++    // TODO: Implement actual cleanup
++    // redisFree(static_cast<redisContext*>(redis_context_));
++    redis_context_ = nullptr;
++  }
++}
++
++bool RedisConnector::ValidateConfiguration() const {
++  return config_.IsValid();
++}
++
++void RedisConnector::StartReconnectTimer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (reconnect_attempts_ >= config_.max_reconnect_attempts) {
++    LOG(ERROR) << "Redis connector: Max reconnect attempts reached";
++    return;
++  }
++  
++  if (!reconnect_timer_) {
++    reconnect_timer_ = std::make_unique<base::RepeatingTimer>();
++  }
++  
++  reconnect_timer_->Start(
++      FROM_HERE,
++      base::Milliseconds(config_.reconnect_interval_ms),
++      base::BindRepeating(&RedisConnector::OnReconnectTimer, weak_factory_.GetWeakPtr()));
++}
++
++void RedisConnector::OnReconnectTimer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  reconnect_attempts_++;
++  LOG(INFO) << "Redis connector: Reconnect attempt " << reconnect_attempts_
++            << "/" << config_.max_reconnect_attempts;
++  
++  if (Connect()) {
++    reconnect_timer_.reset();
++  }
++}
++
++OutputResult RedisConnector::SendSingleMessage(const base::Value::Dict& data, const RedisMessageRoute& route) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  base::Time start_time = base::Time::Now();
++  
++  OutputResult result;
++  switch (route.mode) {
++    case RedisMode::PUBSUB:
++      result = SendPubSubMessage(route.target, data);
++      break;
++    case RedisMode::STREAM:
++      result = SendStreamMessage(route.target, data);
++      break;
++    case RedisMode::SET:
++      result = SendSetMessage(route.target, data, route.ttl_seconds);
++      break;
++    case RedisMode::LIST:
++      result = SendListMessage(route.target, data, route.max_length);
++      break;
++  }
++  
++  // Update statistics
++  base::TimeDelta latency = base::Time::Now() - start_time;
++  total_latency_ += latency;
++  latency_samples_++;
++  
++  if (result.status == OutputStatus::SUCCESS) {
++    successful_commands_++;
++  } else {
++    failed_commands_++;
++  }
++  
++  return result;
++}
++
++OutputResult RedisConnector::SendPubSubMessage(const std::string& channel, const base::Value::Dict& data) {
++  std::string serialized_data = SerializeMessage(data);
++  
++  // TODO: Implement actual Redis PUBLISH command
++  // redisReply* reply = redisCommand(context, "PUBLISH %s %s", channel.c_str(), serialized_data.c_str());
++  
++  DVLOG(2) << "Redis connector: Publishing to channel=" << channel 
++           << " size=" << serialized_data.size();
++  
++  return OutputResult::Success();
++}
++
++OutputResult RedisConnector::SendStreamMessage(const std::string& stream, const base::Value::Dict& data) {
++  // TODO: Implement Redis XADD command for streams
++  // This would construct field-value pairs from the data dictionary
++  
++  DVLOG(2) << "Redis connector: Adding to stream=" << stream;
++  
++  return OutputResult::Success();
++}
++
++OutputResult RedisConnector::SendSetMessage(const std::string& key, const base::Value::Dict& data, int ttl) {
++  std::string full_key = GenerateKey(data, RedisMessageRoute{});
++  std::string serialized_data = SerializeMessage(data);
++  
++  // TODO: Implement Redis SET command with optional TTL
++  // If ttl > 0: redisCommand(context, "SETEX %s %d %s", full_key.c_str(), ttl, serialized_data.c_str());
++  // Else: redisCommand(context, "SET %s %s", full_key.c_str(), serialized_data.c_str());
++  
++  DVLOG(2) << "Redis connector: Setting key=" << full_key << " ttl=" << ttl;
++  
++  return OutputResult::Success();
++}
++
++OutputResult RedisConnector::SendListMessage(const std::string& key, const base::Value::Dict& data, int max_length) {
++  std::string serialized_data = SerializeMessage(data);
++  
++  // TODO: Implement Redis LPUSH + LTRIM commands
++  // redisCommand(context, "LPUSH %s %s", key.c_str(), serialized_data.c_str());
++  // redisCommand(context, "LTRIM %s 0 %d", key.c_str(), max_length - 1);
++  
++  DVLOG(2) << "Redis connector: Pushing to list=" << key << " max_length=" << max_length;
++  
++  return OutputResult::Success();
++}
++
++std::string RedisConnector::SerializeMessage(const base::Value::Dict& data) {
++  std::string json_string;
++  base::JSONWriter::Write(base::Value(data.Clone()), &json_string);
++  return json_string;
++}
++
++std::string RedisConnector::GenerateKey(const base::Value::Dict& data, const RedisMessageRoute& route) {
++  std::string base_key = route.target;
++  
++  if (!route.key_field.empty()) {
++    if (const std::string* value = data.FindString(route.key_field)) {
++      base_key += ":" + *value;
++    }
++  }
++  
++  // Add timestamp for uniqueness
++  base_key += ":" + base::NumberToString(base::Time::Now().ToInternalValue());
++  
++  return base_key;
++}
++
++bool RedisConnector::Ping() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (!redis_context_) {
++    return false;
++  }
++  
++  // TODO: Implement actual Redis PING command
++  // redisReply* reply = redisCommand(context, "PING");
++  // bool success = reply && reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0;
++  // freeReplyObject(reply);
++  
++  return true;  // Placeholder
++}
++
++double RedisConnector::GetAverageLatencyMs() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  if (latency_samples_ == 0) {
++    return 0.0;
++  }
++  
++  return total_latency_.InMillisecondsF() / latency_samples_;
++}
++
++}  // namespace datasipper

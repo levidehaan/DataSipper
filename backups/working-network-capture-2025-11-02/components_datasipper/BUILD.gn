@@ -1,0 +1,115 @@
+# Copyright 2024 The DataSipper Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/features.gni")
+
+component("datasipper") {
+  sources = [
+    "datasipper_database.cc",
+    "datasipper_database.h",
+    "datasipper_service.cc",
+    "datasipper_service.h",
+
+    # Extraction layer
+    "extraction/csv_table_extractor.cc",
+    "extraction/csv_table_extractor.h",
+    "extraction/extraction_result.cc",
+    "extraction/extraction_result.h",
+    "extraction/html_structure_extractor.cc",
+    "extraction/html_structure_extractor.h",
+    "extraction/json_extractor.cc",
+    "extraction/json_extractor.h",
+    "extraction/jsonld_extractor.cc",
+    "extraction/jsonld_extractor.h",
+    "extraction/page_data_detector.cc",
+    "extraction/page_data_detector.h",
+
+    # Database schema management
+    "database/schema_manager.cc",
+    "database/schema_manager.h",
+
+    # Workflow system
+    "workflow/workflow_definition.cc",
+    "workflow/workflow_definition.h",
+    "workflow/workflow_engine.cc",
+    "workflow/workflow_engine.h",
+    "workflow/workflow_storage.cc",
+    "workflow/workflow_storage.h",
+
+    # Workflow nodes
+    "workflow/nodes/ai_node.h",
+    "workflow/nodes/ai_processor_node.cc",
+    "workflow/nodes/ai_processor_node.h",
+    "workflow/nodes/export_node.cc",
+    "workflow/nodes/export_node.h",
+    "workflow/nodes/filter_node.cc",
+    "workflow/nodes/filter_node.h",
+    "workflow/nodes/transform_node.cc",
+    "workflow/nodes/transform_node.h",
+
+    # Exporters
+    "exporters/kafka_exporter.cc",
+    "exporters/kafka_exporter.h",
+    "exporters/postgresql_exporter.cc",
+    "exporters/postgresql_exporter.h",
+    "exporters/redis_exporter.cc",
+    "exporters/redis_exporter.h",
+  ]
+
+  public_deps = [
+    "//base",
+    "//components/keyed_service/core",
+    "//content/public/browser",
+    "//services/network/public/cpp",
+    "//sql",
+    "//url",
+  ]
+
+  deps = [
+    "//base",
+    "//base:base_static",
+    "//chrome/common:constants",
+    "//components/keyed_service/core",
+    "//content/public/browser",
+    "//services/network/public/cpp",
+    "//sql",
+    "//url",
+  ]
+
+  defines = [ "DATASIPPER_IMPLEMENTATION" ]
+}
+
+source_set("test_support") {
+  testonly = true
+
+  sources = [
+    "test/datasipper_test_utils.cc",
+    "test/datasipper_test_utils.h",
+  ]
+
+  public_deps = [
+    ":datasipper",
+    "//base/test:test_support",
+    "//sql:test_support",
+    "//testing/gtest",
+  ]
+}
+
+source_set("unit_tests") {
+  testonly = true
+
+  sources = [
+    "database/datasipper_database_unittest.cc",
+    "storage/network_event_storage_unittest.cc",
+    "storage/circular_event_buffer_unittest.cc",
+  ]
+
+  deps = [
+    ":datasipper",
+    ":test_support",
+    "//base/test:test_support",
+    "//sql:test_support",
+    "//testing/gtest",
+  ]
+}

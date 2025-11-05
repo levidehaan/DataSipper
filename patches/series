@@ -1,0 +1,38 @@
+# DataSipper Patch Series - Corrected
+# This file defines the order in which patches are applied to Chromium
+
+# Upstream Fixes Section
+upstream-fixes/build-system-fixes.patch
+upstream-fixes/network-stack-compatibility.patch
+
+# Core DataSipper Infrastructure
+core/datasipper/base-infrastructure.patch
+core/datasipper/configuration-system.patch
+core/datasipper/database-schema.patch
+core/datasipper/data-storage-infrastructure.patch
+core/datasipper/data-storage-service.patch
+core/datasipper/memory-data-structures.patch
+core/datasipper/stream-selection-system.patch
+core/datasipper/transformation-engine.patch
+
+# Network Interception Core Features
+core/network-interception/url-loader-interceptor.patch
+core/network-interception/websocket-interceptor.patch
+core/network-interception/request-response-capture.patch
+core/network-interception/datasipper-network-observer.patch
+core/network-interception/data-storage-integration.patch
+
+# UI Panel Core Features
+core/ui-panel/browser-ui-integration.patch
+core/ui-panel/datasipper-button-implementation.patch
+core/ui-panel/datasipper-css-styles.patch
+core/ui-panel/datasipper-ipc-communication.patch
+core/ui-panel/datasipper-javascript-frontend.patch
+core/ui-panel/datasipper-javascript-complete.patch
+core/ui-panel/datasipper-panel-implementation.patch
+core/ui-panel/datasipper-webui-resources.patch
+
+# External Integrations
+extra/external-integrations/kafka-connector.patch
+extra/external-integrations/redis-connector.patch
+extra/external-integrations/redis-connector-complete.patch

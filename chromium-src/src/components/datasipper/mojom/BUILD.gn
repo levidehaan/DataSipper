@@ -1,0 +1,21 @@
+# Copyright 2024 The DataSipper Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//mojo/public/tools/bindings/mojom.gni")
+
+mojom("mojom") {
+  sources = [
+    "datasipper.mojom",
+    "network_observer.mojom",
+  ]
+
+  public_deps = [
+    "//mojo/public/mojom/base",
+  ]
+
+  webui_module_path = "chrome://resources/mojo/components/datasipper/mojom"
+
+  # Enable JavaScript bindings generation for network service dependency
+  generate_legacy_js_bindings = true
+}

@@ -1,0 +1,25 @@
+# Ignore large directories that should be volume mounted instead
+chromium-src/
+build/
+out/
+build-logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp

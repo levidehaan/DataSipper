@@ -1,0 +1,325 @@
+# DataSipper: Data storage infrastructure
+#
+# This patch creates the data storage infrastructure for DataSipper,
+# including SQLite database management and in-memory data structures.
+#
+# Affects:
+# - components/datasipper/ (new directory)
+# - components/datasipper/BUILD.gn (new file)
+# - components/datasipper/database/ (new directory)
+
+--- /dev/null
++++ b/components/datasipper/BUILD.gn
+@@ -0,0 +1,63 @@
++# Copyright 2024 The DataSipper Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/features.gni")
++
++component("datasipper") {
++  sources = [
++    "datasipper_service.cc",
++    "datasipper_service.h",
++    "database/datasipper_database.cc",
++    "database/datasipper_database.h",
++    "database/datasipper_database_schema.cc",
++    "database/datasipper_database_schema.h",
++    "storage/network_event_storage.cc",
++    "storage/network_event_storage.h",
++    "storage/websocket_message_storage.cc",
++    "storage/websocket_message_storage.h",
++    "storage/circular_event_buffer.cc",
++    "storage/circular_event_buffer.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//components/keyed_service/core",
++    "//sql",
++    "//url",
++  ]
++
++  deps = [
++    "//base",
++    "//base:base_static",
++    "//components/keyed_service/core",
++    "//content/public/browser",
++    "//sql",
++    "//url",
++  ]
++
++  defines = [ "DATASIPPER_IMPLEMENTATION" ]
++}
++
++source_set("test_support") {
++  testonly = true
++  
++  sources = [
++    "test/datasipper_test_utils.cc",
++    "test/datasipper_test_utils.h",
++  ]
++
++  public_deps = [
++    ":datasipper",
++    "//base/test:test_support",
++    "//sql:test_support",
++    "//testing/gtest",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  
++  sources = [
++    "database/datasipper_database_unittest.cc",
++    "storage/network_event_storage_unittest.cc",
++    "storage/circular_event_buffer_unittest.cc",
++  ]
++
++  deps = [
++    ":datasipper",
++    ":test_support",
++    "//base/test:test_support",
++    "//sql:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/components/datasipper/datasipper_service.h
+@@ -0,0 +1,67 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_DATASIPPER_SERVICE_H_
++#define COMPONENTS_DATASIPPER_DATASIPPER_SERVICE_H_
++
++#include <memory>
++
++#include "base/memory/weak_ptr.h"
++#include "components/keyed_service/core/keyed_service.h"
++
++namespace base {
++class FilePath;
++}
++
++namespace datasipper {
++
++class DataSipperDatabase;
++class NetworkEventStorage;
++class WebSocketMessageStorage;
++class CircularEventBuffer;
++
++// Main service class that coordinates DataSipper functionality
++// and manages the lifecycle of storage components.
++class DataSipperService : public KeyedService {
++ public:
++  explicit DataSipperService(const base::FilePath& database_path);
++  ~DataSipperService() override;
++
++  DataSipperService(const DataSipperService&) = delete;
++  DataSipperService& operator=(const DataSipperService&) = delete;
++
++  // KeyedService implementation
++  void Shutdown() override;
++
++  // Initialize the service and database
++  bool Initialize();
++
++  // Accessors for storage components
++  NetworkEventStorage* network_event_storage() { return network_event_storage_.get(); }
++  WebSocketMessageStorage* websocket_message_storage() { return websocket_message_storage_.get(); }
++  CircularEventBuffer* circular_event_buffer() { return circular_event_buffer_.get(); }
++
++  // Service state
++  bool IsInitialized() const { return initialized_; }
++
++ private:
++  // Initialize database and storage components
++  bool InitializeDatabase();
++  bool InitializeStorageComponents();
++
++  base::FilePath database_path_;
++  bool initialized_ = false;
++
++  // Storage components
++  std::unique_ptr<DataSipperDatabase> database_;
++  std::unique_ptr<NetworkEventStorage> network_event_storage_;
++  std::unique_ptr<WebSocketMessageStorage> websocket_message_storage_;
++  std::unique_ptr<CircularEventBuffer> circular_event_buffer_;
++
++  base::WeakPtrFactory<DataSipperService> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_DATASIPPER_SERVICE_H_
+--- /dev/null
++++ b/components/datasipper/database/datasipper_database.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_H_
++#define COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_H_
++
++#include <memory>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "sql/database.h"
++#include "sql/init_status.h"
++
++namespace datasipper {
++
++// Database wrapper for DataSipper that manages SQLite storage
++// of network events, WebSocket messages, and configuration.
++class DataSipperDatabase {
++ public:
++  explicit DataSipperDatabase(const base::FilePath& database_path);
++  ~DataSipperDatabase();
++
++  DataSipperDatabase(const DataSipperDatabase&) = delete;
++  DataSipperDatabase& operator=(const DataSipperDatabase&) = delete;
++
++  // Initialize the database and create tables
++  sql::InitStatus Init();
++
++  // Database accessors
++  sql::Database* GetDatabase() { return &db_; }
++  bool IsOpen() const { return db_.is_open(); }
++
++  // Transaction helpers
++  bool BeginTransaction();
++  bool CommitTransaction();
++  void RollbackTransaction();
++
++  // Table management
++  bool CreateNetworkEventsTable();
++  bool CreateWebSocketMessagesTable();
++  bool CreateConnectionsTable();
++  bool CreateConfigurationTable();
++
++  // Database maintenance
++  bool Vacuum();
++  bool ClearOldData(base::Time cutoff_time);
++  int64_t GetDatabaseSize();
++
++ private:
++  // Database initialization helpers
++  sql::InitStatus InitializeSchema();
++  sql::InitStatus UpgradeDatabase(int current_version);
++  bool CreateAllTables();
++  bool CreateIndexes();
++
++  // Schema version management
++  static constexpr int kCurrentSchemaVersion = 1;
++  static constexpr int kCompatibleSchemaVersion = 1;
++
++  base::FilePath database_path_;
++  sql::Database db_;
++  
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<DataSipperDatabase> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_H_
+--- /dev/null
++++ b/components/datasipper/storage/circular_event_buffer.h
+@@ -0,0 +1,89 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_
++#define COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_
++
++#include <deque>
++#include <memory>
++
++#include "base/circular_deque.h"
++#include "base/memory/weak_ptr.h"
++#include "base/synchronization/lock.h"
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace datasipper {
++
++// Event types for the circular buffer
++enum class EventType {
++  HTTP_REQUEST,
++  HTTP_RESPONSE,
++  WEBSOCKET_CONNECT,
++  WEBSOCKET_MESSAGE_SENT,
++  WEBSOCKET_MESSAGE_RECEIVED,
++  WEBSOCKET_DISCONNECT,
++};
++
++// A single event in the circular buffer
++struct NetworkEvent {
++  EventType type;
++  base::Time timestamp;
++  std::string connection_id;  // Unique identifier for the connection/request
++  base::Value::Dict data;     // Event-specific data (URL, headers, payload, etc.)
++  
++  NetworkEvent();
++  NetworkEvent(EventType type, const std::string& connection_id, base::Value::Dict data);
++  ~NetworkEvent();
++  
++  NetworkEvent(const NetworkEvent&) = delete;
++  NetworkEvent& operator=(const NetworkEvent&) = delete;
++  
++  NetworkEvent(NetworkEvent&& other);
++  NetworkEvent& operator=(NetworkEvent&& other);
++};
++
++// Thread-safe circular buffer for storing recent network events
++// for real-time display in the DataSipper panel.
++class CircularEventBuffer {
++ public:
++  explicit CircularEventBuffer(size_t max_size = 10000);
++  ~CircularEventBuffer();
++
++  CircularEventBuffer(const CircularEventBuffer&) = delete;
++  CircularEventBuffer& operator=(const CircularEventBuffer&) = delete;
++
++  // Add event to the buffer (thread-safe)
++  void AddEvent(NetworkEvent event);
++
++  // Get recent events (thread-safe)
++  std::vector<NetworkEvent> GetRecentEvents(size_t count = 100) const;
++  std::vector<NetworkEvent> GetEventsSince(base::Time since) const;
++  std::vector<NetworkEvent> GetEventsForConnection(const std::string& connection_id) const;
++
++  // Buffer management
++  void Clear();
++  size_t GetSize() const;
++  size_t GetMaxSize() const { return max_size_; }
++  void SetMaxSize(size_t max_size);
++
++  // Statistics
++  size_t GetEventCount() const;
++  base::Time GetOldestEventTime() const;
++  base::Time GetNewestEventTime() const;
++
++ private:
++  mutable base::Lock lock_;
++  base::circular_deque<std::unique_ptr<NetworkEvent>> events_;
++  size_t max_size_;
++  size_t total_events_added_ = 0;
++
++  // Helper methods (called while holding lock_)
++  void RemoveOldEventsLocked();
++  
++  base::WeakPtrFactory<CircularEventBuffer> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_STORAGE_CIRCULAR_EVENT_BUFFER_H_

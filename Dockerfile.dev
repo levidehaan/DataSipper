@@ -1,0 +1,158 @@
+# DataSipper Development Docker Container
+# Multi-stage build for Chromium development
+
+FROM archlinux:latest AS base
+
+# Install base development tools
+RUN pacman -Sy --noconfirm && \
+    pacman -S --noconfirm --needed \
+    base-devel \
+    git \
+    python \
+    python-setuptools \
+    python-pip \
+    nodejs \
+    npm \
+    ninja \
+    clang \
+    llvm \
+    gdb \
+    sudo \
+    vim \
+    curl \
+    wget
+
+# Create datasipper user
+RUN useradd -m -s /bin/bash datasipper && \
+    echo "datasipper ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER datasipper
+WORKDIR /home/datasipper
+
+# Install depot_tools
+RUN git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+ENV PATH="/home/datasipper/depot_tools:${PATH}"
+
+# Development stage with full dependencies
+FROM base AS development
+
+# Copy DataSipper project
+COPY --chown=datasipper:datasipper . /home/datasipper/datasipper/
+
+WORKDIR /home/datasipper/datasipper
+
+# Install Arch Linux dependencies for Chromium
+RUN sudo pacman -S --noconfirm --needed \
+    gtk3 gtk4 \
+    libx11 libxext libxfixes libxdamage libxcomposite \
+    libxcursor libxi libxrandr libxrender libxss libxtst \
+    mesa libdrm libva libvdpau \
+    vulkan-headers vulkan-validation-layers \
+    alsa-lib pulseaudio libpulse \
+    fontconfig freetype2 harfbuzz pango cairo \
+    libjpeg-turbo libpng libwebp ffmpeg opus libvpx \
+    libvorbis flac speex \
+    nss nspr openssl krb5 libcups \
+    dbus glib2 glibc gcc-libs zlib bzip2 xz \
+    libffi expat libxml2 libxslt systemd-libs \
+    p7zip unzip zip subversion re2 snappy minizip \
+    libevent libusb jdk-openjdk valgrind
+
+# Set up environment
+ENV DEPOT_TOOLS_UPDATE=1
+ENV DEPOT_TOOLS_METRICS=0
+ENV GYP_DEFINES="target_arch=x64"
+
+# Create volume mount points
+VOLUME ["/home/datasipper/datasipper/chromium-src"]
+VOLUME ["/home/datasipper/datasipper/build-cache"]
+
+# Expose potential development ports
+EXPOSE 8080 8000 9229
+
+# Entry point for development
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN sudo chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/bin/bash"]
+
+# Build stage for CI/production builds
+FROM development AS builder
+
+# Pre-fetch Chromium source in build stage
+RUN mkdir -p chromium-src && cd chromium-src && \
+    fetch chromium
+
+# Copy current patches and apply them
+COPY patches/ /home/datasipper/datasipper/patches/
+COPY scripts/ /home/datasipper/datasipper/scripts/
+
+RUN cd chromium-src/src && \
+    git checkout 6d0796400dc7f4912cf196e27314fd51731de2d2 && \
+    gclient sync --with_branch_heads --with_tags
+
+# Apply DataSipper patches
+RUN cd chromium-src/src && \
+    python3 ../../scripts/patches.py apply
+
+# Configure build
+RUN cd chromium-src/src && \
+    gn gen out/Release --args='
+        is_debug=false
+        is_official_build=true
+        symbol_level=0
+        enable_nacl=false
+        enable_remoting=false
+        use_cups=true
+        proprietary_codecs=true
+        ffmpeg_branding="Chrome"
+        datasipper_enabled=true
+        datasipper_network_interception=true
+        datasipper_ui_panel=true
+        datasipper_external_integrations=true
+    '
+
+# Build DataSipper (this will take hours)
+RUN cd chromium-src/src && \
+    ninja -C out/Release chrome
+
+# Production runtime image
+FROM archlinux:latest AS runtime
+
+# Install runtime dependencies only
+RUN pacman -Sy --noconfirm && \
+    pacman -S --noconfirm --needed \
+    gtk3 \
+    libx11 libxext libxcomposite libxcursor libxi libxrandr \
+    mesa libdrm \
+    alsa-lib pulseaudio \
+    fontconfig freetype2 \
+    nss nspr \
+    dbus glib2 \
+    && pacman -Scc --noconfirm
+
+# Create runtime user
+RUN useradd -m -s /bin/bash datasipper
+
+# Copy built DataSipper binary and required files
+COPY --from=builder --chown=datasipper:datasipper \
+    /home/datasipper/datasipper/chromium-src/src/out/Release/chrome \
+    /usr/local/bin/datasipper
+
+COPY --from=builder --chown=datasipper:datasipper \
+    /home/datasipper/datasipper/chromium-src/src/out/Release/*.so \
+    /usr/local/lib/datasipper/
+
+COPY --from=builder --chown=datasipper:datasipper \
+    /home/datasipper/datasipper/chromium-src/src/out/Release/*.pak \
+    /usr/local/share/datasipper/
+
+USER datasipper
+WORKDIR /home/datasipper
+
+# Set up runtime environment
+ENV LD_LIBRARY_PATH="/usr/local/lib/datasipper:${LD_LIBRARY_PATH}"
+
+EXPOSE 8080
+
+CMD ["/usr/local/bin/datasipper", "--no-sandbox", "--disable-dev-shm-usage"]

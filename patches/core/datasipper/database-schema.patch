@@ -1,0 +1,428 @@
+# DataSipper: Database schema implementation
+#
+# This patch implements the SQLite database schema and operations
+# for storing network events and WebSocket messages.
+#
+# Affects:
+# - components/datasipper/database/datasipper_database_schema.cc (new file)
+# - components/datasipper/database/datasipper_database.cc (new file)
+
+--- /dev/null
++++ b/components/datasipper/database/datasipper_database_schema.h
+@@ -0,0 +1,51 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_SCHEMA_H_
++#define COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_SCHEMA_H_
++
++namespace sql {
++class Database;
++}
++
++namespace datasipper {
++
++// Database schema constants and SQL statements for DataSipper
++namespace schema {
++
++// Schema version
++constexpr int kCurrentVersion = 1;
++constexpr int kCompatibleVersion = 1;
++
++// Table creation SQL statements
++extern const char kCreateNetworkEventsTableSql[];
++extern const char kCreateWebSocketMessagesTableSql[];
++extern const char kCreateConnectionsTableSql[];
++extern const char kCreateConfigurationTableSql[];
++
++// Index creation SQL statements
++extern const char kCreateNetworkEventsTimestampIndexSql[];
++extern const char kCreateNetworkEventsUrlIndexSql[];
++extern const char kCreateWebSocketMessagesTimestampIndexSql[];
++extern const char kCreateWebSocketMessagesConnectionIndexSql[];
++extern const char kCreateConnectionsUrlIndexSql[];
++
++// Common query SQL statements
++extern const char kInsertNetworkEventSql[];
++extern const char kInsertWebSocketMessageSql[];
++extern const char kInsertConnectionSql[];
++extern const char kUpdateConnectionSql[];
++
++// Utility functions
++bool CreateAllTables(sql::Database* db);
++bool CreateAllIndexes(sql::Database* db);
++bool UpgradeSchema(sql::Database* db, int from_version, int to_version);
++
++}  // namespace schema
++
++}  // namespace datasipper
++
++#endif  // COMPONENTS_DATASIPPER_DATABASE_DATASIPPER_DATABASE_SCHEMA_H_
+--- /dev/null
++++ b/components/datasipper/database/datasipper_database_schema.cc
+@@ -0,0 +1,192 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/database/datasipper_database_schema.h"
++
++#include "sql/database.h"
++#include "sql/statement.h"
++
++namespace datasipper {
++namespace schema {
++
++// Network events table stores HTTP/HTTPS requests and responses
++const char kCreateNetworkEventsTableSql[] = R"(
++  CREATE TABLE IF NOT EXISTS network_events (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    connection_id TEXT NOT NULL,
++    timestamp INTEGER NOT NULL,
++    event_type INTEGER NOT NULL,  -- 0=request, 1=response
++    url TEXT NOT NULL,
++    method TEXT,
++    status_code INTEGER,
++    request_headers TEXT,
++    response_headers TEXT,
++    request_body BLOB,
++    response_body BLOB,
++    request_size INTEGER DEFAULT 0,
++    response_size INTEGER DEFAULT 0,
++    duration_ms INTEGER DEFAULT 0,
++    error_code INTEGER DEFAULT 0
++  )
++)";
++
++// WebSocket messages table stores individual WebSocket frames
++const char kCreateWebSocketMessagesTableSql[] = R"(
++  CREATE TABLE IF NOT EXISTS websocket_messages (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    connection_id TEXT NOT NULL,
++    timestamp INTEGER NOT NULL,
++    direction INTEGER NOT NULL,  -- 0=outgoing, 1=incoming
++    opcode INTEGER NOT NULL,     -- WebSocket frame opcode
++    payload TEXT,                -- Message payload (text or hex for binary)
++    payload_size INTEGER NOT NULL,
++    is_final INTEGER NOT NULL DEFAULT 1,  -- FIN bit
++    FOREIGN KEY (connection_id) REFERENCES connections(connection_id)
++  )
++)";
++
++// Connections table stores WebSocket connection metadata
++const char kCreateConnectionsTableSql[] = R"(
++  CREATE TABLE IF NOT EXISTS connections (
++    connection_id TEXT PRIMARY KEY,
++    url TEXT NOT NULL,
++    start_time INTEGER NOT NULL,
++    end_time INTEGER,
++    close_code INTEGER,
++    close_reason TEXT,
++    error_message TEXT,
++    messages_sent INTEGER DEFAULT 0,
++    messages_received INTEGER DEFAULT 0,
++    bytes_sent INTEGER DEFAULT 0,
++    bytes_received INTEGER DEFAULT 0,
++    was_clean_close INTEGER DEFAULT 0
++  )
++)";
++
++// Configuration table stores DataSipper settings
++const char kCreateConfigurationTableSql[] = R"(
++  CREATE TABLE IF NOT EXISTS configuration (
++    key TEXT PRIMARY KEY,
++    value TEXT NOT NULL,
++    updated_time INTEGER NOT NULL
++  )
++)";
++
++// Indexes for performance
++const char kCreateNetworkEventsTimestampIndexSql[] = R"(
++  CREATE INDEX IF NOT EXISTS idx_network_events_timestamp 
++  ON network_events(timestamp)
++)";
++
++const char kCreateNetworkEventsUrlIndexSql[] = R"(
++  CREATE INDEX IF NOT EXISTS idx_network_events_url 
++  ON network_events(url)
++)";
++
++const char kCreateWebSocketMessagesTimestampIndexSql[] = R"(
++  CREATE INDEX IF NOT EXISTS idx_websocket_messages_timestamp 
++  ON websocket_messages(timestamp)
++)";
++
++const char kCreateWebSocketMessagesConnectionIndexSql[] = R"(
++  CREATE INDEX IF NOT EXISTS idx_websocket_messages_connection 
++  ON websocket_messages(connection_id, timestamp)
++)";
++
++const char kCreateConnectionsUrlIndexSql[] = R"(
++  CREATE INDEX IF NOT EXISTS idx_connections_url 
++  ON connections(url)
++)";
++
++// Insert statements
++const char kInsertNetworkEventSql[] = R"(
++  INSERT INTO network_events (
++    connection_id, timestamp, event_type, url, method, status_code,
++    request_headers, response_headers, request_body, response_body,
++    request_size, response_size, duration_ms, error_code
++  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++)";
++
++const char kInsertWebSocketMessageSql[] = R"(
++  INSERT INTO websocket_messages (
++    connection_id, timestamp, direction, opcode, payload, payload_size, is_final
++  ) VALUES (?, ?, ?, ?, ?, ?, ?)
++)";
++
++const char kInsertConnectionSql[] = R"(
++  INSERT OR REPLACE INTO connections (
++    connection_id, url, start_time, end_time, close_code, close_reason,
++    error_message, messages_sent, messages_received, bytes_sent, bytes_received,
++    was_clean_close
++  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++)";
++
++const char kUpdateConnectionSql[] = R"(
++  UPDATE connections SET
++    end_time = ?, close_code = ?, close_reason = ?, error_message = ?,
++    messages_sent = ?, messages_received = ?, bytes_sent = ?, bytes_received = ?,
++    was_clean_close = ?
++  WHERE connection_id = ?
++)";
++
++bool CreateAllTables(sql::Database* db) {
++  if (!db->is_open()) {
++    return false;
++  }
++
++  // Create all tables
++  if (!db->Execute(kCreateNetworkEventsTableSql)) {
++    DLOG(ERROR) << "Failed to create network_events table";
++    return false;
++  }
++
++  if (!db->Execute(kCreateWebSocketMessagesTableSql)) {
++    DLOG(ERROR) << "Failed to create websocket_messages table";
++    return false;
++  }
++
++  if (!db->Execute(kCreateConnectionsTableSql)) {
++    DLOG(ERROR) << "Failed to create connections table";
++    return false;
++  }
++
++  if (!db->Execute(kCreateConfigurationTableSql)) {
++    DLOG(ERROR) << "Failed to create configuration table";
++    return false;
++  }
++
++  return true;
++}
++
++bool CreateAllIndexes(sql::Database* db) {
++  if (!db->is_open()) {
++    return false;
++  }
++
++  // Create all indexes
++  const char* index_statements[] = {
++    kCreateNetworkEventsTimestampIndexSql,
++    kCreateNetworkEventsUrlIndexSql,
++    kCreateWebSocketMessagesTimestampIndexSql,
++    kCreateWebSocketMessagesConnectionIndexSql,
++    kCreateConnectionsUrlIndexSql,
++  };
++
++  for (const char* statement : index_statements) {
++    if (!db->Execute(statement)) {
++      DLOG(ERROR) << "Failed to create index";
++      return false;
++    }
++  }
++
++  return true;
++}
++
++bool UpgradeSchema(sql::Database* db, int from_version, int to_version) {
++  // Currently no schema upgrades needed (version 1 is initial)
++  // When we need to upgrade schemas, implement migration logic here
++  return from_version == to_version;
++}
++
++}  // namespace schema
++}  // namespace datasipper
+--- /dev/null
++++ b/components/datasipper/database/datasipper_database.cc
+@@ -0,0 +1,144 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/datasipper/database/datasipper_database.h"
++
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/metrics/histogram_macros.h"
++#include "base/time/time.h"
++#include "components/datasipper/database/datasipper_database_schema.h"
++#include "sql/meta_table.h"
++#include "sql/statement.h"
++#include "sql/transaction.h"
++
++namespace datasipper {
++
++DataSipperDatabase::DataSipperDatabase(const base::FilePath& database_path)
++    : database_path_(database_path) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++DataSipperDatabase::~DataSipperDatabase() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++sql::InitStatus DataSipperDatabase::Init() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++
++  if (db_.is_open()) {
++    return sql::INIT_OK;
++  }
++
++  // Ensure the database directory exists
++  if (!base::CreateDirectory(database_path_.DirName())) {
++    DLOG(ERROR) << "Failed to create DataSipper database directory";
++    return sql::INIT_FAILURE;
++  }
++
++  // Open the database
++  if (!db_.Open(database_path_)) {
++    DLOG(ERROR) << "Failed to open DataSipper database: " << database_path_;
++    return sql::INIT_FAILURE;
++  }
++
++  // Configure SQLite settings
++  db_.Preload();
++  
++  // Set pragmas for performance and reliability
++  if (!db_.Execute("PRAGMA foreign_keys=ON") ||
++      !db_.Execute("PRAGMA journal_mode=WAL") ||
++      !db_.Execute("PRAGMA synchronous=NORMAL")) {
++    DLOG(ERROR) << "Failed to set SQLite pragmas";
++    return sql::INIT_FAILURE;
++  }
++
++  return InitializeSchema();
++}
++
++sql::InitStatus DataSipperDatabase::InitializeSchema() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK(db_.is_open());
++
++  sql::MetaTable meta_table;
++  if (!meta_table.Init(&db_, schema::kCurrentVersion, schema::kCompatibleVersion)) {
++    DLOG(ERROR) << "Failed to initialize DataSipper meta table";
++    return sql::INIT_FAILURE;
++  }
++
++  int current_version = meta_table.GetVersionNumber();
++  if (current_version > schema::kCurrentVersion) {
++    DLOG(ERROR) << "DataSipper database version too new: " << current_version;
++    return sql::INIT_TOO_NEW;
++  }
++
++  // Create or upgrade schema
++  if (current_version < schema::kCurrentVersion) {
++    sql::Transaction transaction(&db_);
++    if (!transaction.Begin()) {
++      return sql::INIT_FAILURE;
++    }
++
++    if (current_version == 0) {
++      // New database
++      if (!CreateAllTables()) {
++        return sql::INIT_FAILURE;
++      }
++    } else {
++      // Upgrade existing database
++      if (!schema::UpgradeSchema(&db_, current_version, schema::kCurrentVersion)) {
++        DLOG(ERROR) << "Failed to upgrade DataSipper database schema";
++        return sql::INIT_FAILURE;
++      }
++    }
++
++    meta_table.SetVersionNumber(schema::kCurrentVersion);
++    
++    if (!transaction.Commit()) {
++      return sql::INIT_FAILURE;
++    }
++  }
++
++  // Create indexes
++  if (!CreateIndexes()) {
++    DLOG(WARNING) << "Failed to create some DataSipper database indexes";
++    // Continue anyway - indexes are for performance, not correctness
++  }
++
++  return sql::INIT_OK;
++}
++
++bool DataSipperDatabase::CreateAllTables() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return schema::CreateAllTables(&db_);
++}
++
++bool DataSipperDatabase::CreateIndexes() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return schema::CreateAllIndexes(&db_);
++}
++
++bool DataSipperDatabase::BeginTransaction() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return db_.BeginTransaction();
++}
++
++bool DataSipperDatabase::CommitTransaction() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return db_.CommitTransaction();
++}
++
++void DataSipperDatabase::RollbackTransaction() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  db_.RollbackTransaction();
++}
++
++bool DataSipperDatabase::Vacuum() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return db_.Execute("VACUUM");
++}
++
++bool DataSipperDatabase::ClearOldData(base::Time cutoff_time) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  int64_t cutoff_microseconds = cutoff_time.ToInternalValue();
++  
++  sql::Statement statement_events(db_.GetUniqueStatement(
++      "DELETE FROM network_events WHERE timestamp < ?"));
++  statement_events.BindInt64(0, cutoff_microseconds);
++  
++  sql::Statement statement_messages(db_.GetUniqueStatement(
++      "DELETE FROM websocket_messages WHERE timestamp < ?"));
++  statement_messages.BindInt64(0, cutoff_microseconds);
++  
++  return statement_events.Run() && statement_messages.Run();
++}
++
++int64_t DataSipperDatabase::GetDatabaseSize() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  
++  int64_t size = 0;
++  if (base::GetFileSize(database_path_, &size)) {
++    return size;
++  }
++  return -1;
++}
++
++}  // namespace datasipper

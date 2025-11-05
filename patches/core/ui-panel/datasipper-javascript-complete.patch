@@ -1,0 +1,817 @@
+# DataSipper: Complete JavaScript frontend implementation
+#
+# This patch provides the complete JavaScript implementation for the DataSipper
+# monitoring panel, including real-time event display, stream configuration,
+# and output connector management.
+
+--- /dev/null
++++ b/chrome/browser/resources/datasipper/datasipper.js
+@@ -0,0 +1,782 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/**
++ * DataSipper Frontend Application
++ * Provides real-time network monitoring, stream configuration, and data visualization
++ */
++
++class DataSipperApp {
++  constructor() {
++    this.eventCache = new Map();
++    this.streamRules = new Map();
++    this.outputConnectors = new Map();
++    this.activeTab = 'events';
++    this.autoScroll = true;
++    this.pauseCapture = false;
++    this.eventFilter = 'all';
++    this.maxEvents = 1000;
++    
++    // WebSocket connection for real-time updates
++    this.ws = null;
++    this.reconnectInterval = 5000;
++    this.lastEventId = 0;
++    
++    this.init();
++  }
++
++  init() {
++    this.setupEventListeners();
++    this.setupTabs();
++    this.setupModals();
++    this.connectWebSocket();
++    this.loadInitialData();
++    
++    // Start periodic updates
++    setInterval(() => this.updateStatistics(), 1000);
++    
++    console.log('DataSipper App initialized');
++  }
++
++  setupEventListeners() {
++    // Header controls
++    document.getElementById('refresh-btn').addEventListener('click', () => this.refreshData());
++    document.getElementById('clear-btn').addEventListener('click', () => this.clearEvents());
++    document.getElementById('settings-btn').addEventListener('click', () => this.showSettings());
++
++    // Event controls
++    document.getElementById('auto-scroll').addEventListener('change', (e) => {
++      this.autoScroll = e.target.checked;
++    });
++    
++    document.getElementById('pause-capture').addEventListener('change', (e) => {
++      this.pauseCapture = e.target.checked;
++      this.sendMessage('pauseCapture', { paused: this.pauseCapture });
++    });
++    
++    document.getElementById('event-filter').addEventListener('change', (e) => {
++      this.eventFilter = e.target.value;
++      this.filterEvents();
++    });
++
++    // Stream controls
++    document.getElementById('add-rule-btn').addEventListener('click', () => this.showRuleModal());
++    
++    // Output controls
++    document.getElementById('add-output-btn').addEventListener('click', () => this.showOutputModal());
++    
++    // Transform controls
++    document.getElementById('test-transform-btn').addEventListener('click', () => this.testTransform());
++    document.getElementById('save-transform-btn').addEventListener('click', () => this.saveTransform());
++  }
++
++  setupTabs() {
++    const tabButtons = document.querySelectorAll('.tab-btn');
++    const tabPanels = document.querySelectorAll('.tab-panel');
++
++    tabButtons.forEach(button => {
++      button.addEventListener('click', () => {
++        const tabName = button.dataset.tab;
++        
++        // Update button states
++        tabButtons.forEach(btn => btn.classList.remove('active'));
++        button.classList.add('active');
++        
++        // Update panel visibility
++        tabPanels.forEach(panel => {
++          panel.classList.remove('active');
++          if (panel.id === `${tabName}-tab`) {
++            panel.classList.add('active');
++          }
++        });
++        
++        this.activeTab = tabName;
++        this.onTabChanged(tabName);
++      });
++    });
++  }
++
++  setupModals() {
++    // Modal close handlers
++    document.querySelectorAll('.modal-close').forEach(closeBtn => {
++      closeBtn.addEventListener('click', (e) => {
++        const modal = e.target.closest('.modal');
++        this.hideModal(modal);
++      });
++    });
++
++    // Click outside modal to close
++    document.querySelectorAll('.modal').forEach(modal => {
++      modal.addEventListener('click', (e) => {
++        if (e.target === modal) {
++          this.hideModal(modal);
++        }
++      });
++    });
++
++    // Rule modal handlers
++    this.setupRuleModal();
++  }
++
++  setupRuleModal() {
++    const addConditionBtn = document.getElementById('add-condition-btn');
++    const conditionsContainer = document.getElementById('conditions-container');
++    
++    addConditionBtn.addEventListener('click', () => {
++      this.addCondition(conditionsContainer);
++    });
++
++    // Modal action buttons
++    document.querySelector('[data-action="save"]').addEventListener('click', () => {
++      this.saveRule();
++    });
++    
++    document.querySelector('[data-action="cancel"]').addEventListener('click', () => {
++      this.hideModal(document.getElementById('rule-modal'));
++    });
++  }
++
++  connectWebSocket() {
++    try {
++      // Use chrome:// WebSocket endpoint for IPC communication
++      this.ws = new WebSocket('ws://localhost:9222/datasipper');
++      
++      this.ws.onopen = () => {
++        console.log('DataSipper WebSocket connected');
++        this.updateConnectionStatus('Connected');
++      };
++      
++      this.ws.onmessage = (event) => {
++        try {
++          const data = JSON.parse(event.data);
++          this.handleWebSocketMessage(data);
++        } catch (error) {
++          console.error('Error parsing WebSocket message:', error);
++        }
++      };
++      
++      this.ws.onclose = () => {
++        console.log('DataSipper WebSocket disconnected');
++        this.updateConnectionStatus('Disconnected');
++        
++        // Attempt to reconnect
++        setTimeout(() => this.connectWebSocket(), this.reconnectInterval);
++      };
++      
++      this.ws.onerror = (error) => {
++        console.error('DataSipper WebSocket error:', error);
++      };
++      
++    } catch (error) {
++      console.error('Failed to connect WebSocket:', error);
++      setTimeout(() => this.connectWebSocket(), this.reconnectInterval);
++    }
++  }
++
++  handleWebSocketMessage(data) {
++    switch (data.type) {
++      case 'networkEvent':
++        this.handleNetworkEvent(data.event);
++        break;
++      case 'streamUpdate':
++        this.handleStreamUpdate(data.stream);
++        break;
++      case 'statistics':
++        this.handleStatisticsUpdate(data.stats);
++        break;
++      case 'outputStatus':
++        this.handleOutputStatus(data.output);
++        break;
++      default:
++        console.warn('Unknown WebSocket message type:', data.type);
++    }
++  }
++
++  handleNetworkEvent(event) {
++    if (this.pauseCapture) return;
++    
++    // Add to cache
++    this.eventCache.set(event.id, event);
++    this.lastEventId = Math.max(this.lastEventId, event.id || 0);
++    
++    // Limit cache size
++    if (this.eventCache.size > this.maxEvents) {
++      const oldestKey = this.eventCache.keys().next().value;
++      this.eventCache.delete(oldestKey);
++    }
++    
++    // Update display if on events tab
++    if (this.activeTab === 'events') {
++      this.addEventToDisplay(event);
++    }
++  }
++
++  handleStreamUpdate(stream) {
++    this.streamRules.set(stream.name, stream);
++    if (this.activeTab === 'streams') {
++      this.updateStreamDisplay();
++    }
++  }
++
++  handleStatisticsUpdate(stats) {
++    this.updateStatisticsDisplay(stats);
++  }
++
++  handleOutputStatus(output) {
++    this.outputConnectors.set(output.name, output);
++    this.updateOutputStatus(output.name, output.status);
++  }
++
++  addEventToDisplay(event) {
++    if (!this.passesFilter(event)) return;
++    
++    const eventsList = document.getElementById('events-list');
++    const eventElement = this.createEventElement(event);
++    
++    eventsList.appendChild(eventElement);
++    
++    // Auto-scroll if enabled
++    if (this.autoScroll) {
++      eventElement.scrollIntoView({ behavior: 'smooth', block: 'end' });
++    }
++    
++    // Limit displayed events
++    while (eventsList.children.length > this.maxEvents) {
++      eventsList.removeChild(eventsList.firstChild);
++    }
++  }
++
++  createEventElement(event) {
++    const div = document.createElement('div');
++    div.className = `event-item ${event.type} ${event.error ? 'error' : ''}`;
++    div.dataset.eventId = event.id;
++    
++    const timestamp = new Date(event.timestamp).toLocaleTimeString();
++    const method = event.method || 'WS';
++    const url = this.truncateUrl(event.url);
++    const status = event.status_code || (event.type === 'websocket' ? 'MSG' : '');
++    const size = this.formatBytes(event.size || 0);
++    
++    div.innerHTML = `
++      <div class="event-time">${timestamp}</div>
++      <div class="event-method ${method.toLowerCase()}">${method}</div>
++      <div class="event-url" title="${event.url}">${url}</div>
++      <div class="event-status ${this.getStatusClass(event.status_code)}">${status}</div>
++      <div class="event-size">${size}</div>
++      <div class="event-stream">${event.stream || 'default'}</div>
++    `;
++    
++    // Click to expand details
++    div.addEventListener('click', () => this.showEventDetails(event));
++    
++    return div;
++  }
++
++  truncateUrl(url) {
++    if (!url) return '';
++    if (url.length <= 60) return url;
++    return url.substring(0, 30) + '...' + url.substring(url.length - 27);
++  }
++
++  getStatusClass(statusCode) {
++    if (!statusCode) return '';
++    if (statusCode >= 200 && statusCode < 300) return 'success';
++    if (statusCode >= 300 && statusCode < 400) return 'redirect';
++    if (statusCode >= 400) return 'error';
++    return '';
++  }
++
++  formatBytes(bytes) {
++    if (bytes === 0) return '0 B';
++    const k = 1024;
++    const sizes = ['B', 'KB', 'MB', 'GB'];
++    const i = Math.floor(Math.log(bytes) / Math.log(k));
++    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
++  }
++
++  passesFilter(event) {
++    switch (this.eventFilter) {
++      case 'http':
++        return event.type === 'http_request' || event.type === 'http_response';
++      case 'websocket':
++        return event.type === 'websocket';
++      case 'errors':
++        return event.error || (event.status_code && event.status_code >= 400);
++      default:
++        return true;
++    }
++  }
++
++  filterEvents() {
++    const eventsList = document.getElementById('events-list');
++    const events = Array.from(eventsList.children);
++    
++    events.forEach(eventElement => {
++      const eventId = eventElement.dataset.eventId;
++      const event = this.eventCache.get(parseInt(eventId));
++      
++      if (event && this.passesFilter(event)) {
++        eventElement.style.display = '';
++      } else {
++        eventElement.style.display = 'none';
++      }
++    });
++  }
++
++  showEventDetails(event) {
++    // Create and show event details modal
++    const modal = document.createElement('div');
++    modal.className = 'modal';
++    modal.innerHTML = `
++      <div class="modal-content event-details-modal">
++        <div class="modal-header">
++          <h2>Event Details</h2>
++          <button class="modal-close">&times;</button>
++        </div>
++        <div class="modal-body">
++          <div class="event-details">
++            <div class="detail-section">
++              <h3>General</h3>
++              <div class="detail-grid">
++                <div class="detail-item">
++                  <span class="detail-label">URL:</span>
++                  <span class="detail-value">${event.url}</span>
++                </div>
++                <div class="detail-item">
++                  <span class="detail-label">Method:</span>
++                  <span class="detail-value">${event.method || 'N/A'}</span>
++                </div>
++                <div class="detail-item">
++                  <span class="detail-label">Status:</span>
++                  <span class="detail-value">${event.status_code || 'N/A'}</span>
++                </div>
++                <div class="detail-item">
++                  <span class="detail-label">Time:</span>
++                  <span class="detail-value">${new Date(event.timestamp).toLocaleString()}</span>
++                </div>
++              </div>
++            </div>
++            
++            ${event.request_headers ? `
++            <div class="detail-section">
++              <h3>Request Headers</h3>
++              <pre class="headers-display">${event.request_headers}</pre>
++            </div>
++            ` : ''}
++            
++            ${event.response_headers ? `
++            <div class="detail-section">
++              <h3>Response Headers</h3>
++              <pre class="headers-display">${event.response_headers}</pre>
++            </div>
++            ` : ''}
++            
++            ${event.request_body ? `
++            <div class="detail-section">
++              <h3>Request Body</h3>
++              <pre class="body-display">${this.formatBody(event.request_body)}</pre>
++            </div>
++            ` : ''}
++            
++            ${event.response_body ? `
++            <div class="detail-section">
++              <h3>Response Body</h3>
++              <pre class="body-display">${this.formatBody(event.response_body)}</pre>
++            </div>
++            ` : ''}
++          </div>
++        </div>
++      </div>
++    `;
++    
++    document.body.appendChild(modal);
++    modal.style.display = 'flex';
++    
++    // Close handler
++    modal.querySelector('.modal-close').addEventListener('click', () => {
++      document.body.removeChild(modal);
++    });
++    
++    modal.addEventListener('click', (e) => {
++      if (e.target === modal) {
++        document.body.removeChild(modal);
++      }
++    });
++  }
++
++  formatBody(body) {
++    if (!body) return '';
++    
++    try {
++      // Try to parse and format JSON
++      const parsed = JSON.parse(body);
++      return JSON.stringify(parsed, null, 2);
++    } catch {
++      // Return as-is if not JSON
++      return body;
++    }
++  }
++
++  onTabChanged(tabName) {
++    switch (tabName) {
++      case 'events':
++        this.refreshEvents();
++        break;
++      case 'streams':
++        this.loadStreamRules();
++        break;
++      case 'outputs':
++        this.loadOutputConnectors();
++        break;
++      case 'transform':
++        this.loadTransformCode();
++        break;
++    }
++  }
++
++  showRuleModal(rule = null) {
++    const modal = document.getElementById('rule-modal');
++    const title = document.getElementById('rule-modal-title');
++    
++    if (rule) {
++      title.textContent = 'Edit Stream Rule';
++      this.populateRuleForm(rule);
++    } else {
++      title.textContent = 'Create Stream Rule';
++      this.clearRuleForm();
++    }
++    
++    this.showModal(modal);
++  }
++
++  addCondition(container) {
++    const conditionDiv = document.createElement('div');
++    conditionDiv.className = 'condition-item';
++    conditionDiv.innerHTML = `
++      <select class="condition-field">
++        <option value="url">URL</option>
++        <option value="method">Method</option>
++        <option value="status">Status Code</option>
++        <option value="header">Header</option>
++        <option value="body">Body Content</option>
++      </select>
++      <select class="condition-operator">
++        <option value="equals">Equals</option>
++        <option value="contains">Contains</option>
++        <option value="startsWith">Starts With</option>
++        <option value="regex">Regex Match</option>
++      </select>
++      <input type="text" class="condition-value" placeholder="Value">
++      <button type="button" class="remove-condition">×</button>
++    `;
++    
++    conditionDiv.querySelector('.remove-condition').addEventListener('click', () => {
++      container.removeChild(conditionDiv);
++    });
++    
++    container.appendChild(conditionDiv);
++  }
++
++  saveRule() {
++    const form = document.getElementById('rule-form');
++    const formData = new FormData(form);
++    
++    const conditions = Array.from(document.querySelectorAll('.condition-item')).map(item => ({
++      field: item.querySelector('.condition-field').value,
++      operator: item.querySelector('.condition-operator').value,
++      value: item.querySelector('.condition-value').value
++    }));
++    
++    const rule = {
++      name: document.getElementById('rule-name').value,
++      description: document.getElementById('rule-description').value,
++      conditions: conditions,
++      logic: document.getElementById('rule-logic').value,
++      group: document.getElementById('rule-group').value,
++      output: document.getElementById('rule-output').value
++    };
++    
++    this.sendMessage('createStreamRule', rule);
++    this.hideModal(document.getElementById('rule-modal'));
++  }
++
++  loadStreamRules() {
++    this.sendMessage('getStreamRules', {});
++  }
++
++  updateStreamDisplay() {
++    const rulesList = document.getElementById('rules-list');
++    rulesList.innerHTML = '';
++    
++    this.streamRules.forEach((rule, name) => {
++      const ruleElement = this.createRuleElement(rule);
++      rulesList.appendChild(ruleElement);
++    });
++  }
++
++  createRuleElement(rule) {
++    const div = document.createElement('div');
++    div.className = 'rule-item';
++    div.innerHTML = `
++      <div class="rule-header">
++        <h3>${rule.name}</h3>
++        <div class="rule-actions">
++          <button class="btn btn-sm edit-rule">Edit</button>
++          <button class="btn btn-sm btn-danger delete-rule">Delete</button>
++        </div>
++      </div>
++      <div class="rule-description">${rule.description}</div>
++      <div class="rule-conditions">
++        <strong>Conditions:</strong> ${rule.conditions.length} rules (${rule.logic})
++      </div>
++      <div class="rule-stats">
++        <span>Events matched: ${rule.matchCount || 0}</span>
++        <span>Target: ${rule.group || 'default'}</span>
++      </div>
++    `;
++    
++    div.querySelector('.edit-rule').addEventListener('click', () => {
++      this.showRuleModal(rule);
++    });
++    
++    div.querySelector('.delete-rule').addEventListener('click', () => {
++      this.deleteRule(rule.name);
++    });
++    
++    return div;
++  }
++
++  deleteRule(ruleName) {
++    if (confirm(`Delete rule "${ruleName}"?`)) {
++      this.sendMessage('deleteStreamRule', { name: ruleName });
++    }
++  }
++
++  loadOutputConnectors() {
++    this.sendMessage('getOutputConnectors', {});
++    this.setupOutputForms();
++  }
++
++  setupOutputForms() {
++    // Setup Kafka configuration form
++    this.setupKafkaForm();
++    
++    // Setup Redis configuration form
++    this.setupRedisForm();
++  }
++
++  setupKafkaForm() {
++    const kafkaConfig = document.getElementById('kafka-config');
++    kafkaConfig.innerHTML = `
++      <div class="config-form">
++        <div class="form-group">
++          <label>Bootstrap Servers</label>
++          <input type="text" id="kafka-servers" placeholder="localhost:9092" class="form-input">
++        </div>
++        <div class="form-group">
++          <label>Topic</label>
++          <input type="text" id="kafka-topic" placeholder="datasipper-events" class="form-input">
++        </div>
++        <div class="form-group">
++          <label>Client ID</label>
++          <input type="text" id="kafka-client-id" placeholder="datasipper" class="form-input">
++        </div>
++        <div class="form-actions">
++          <button class="btn btn-primary" onclick="dataSipperApp.testKafkaConnection()">Test</button>
++          <button class="btn btn-success" onclick="dataSipperApp.saveKafkaConfig()">Save</button>
++        </div>
++      </div>
++    `;
++  }
++
++  setupRedisForm() {
++    const redisConfig = document.getElementById('redis-config');
++    redisConfig.innerHTML = `
++      <div class="config-form">
++        <div class="form-group">
++          <label>Host</label>
++          <input type="text" id="redis-host" placeholder="localhost" class="form-input">
++        </div>
++        <div class="form-group">
++          <label>Port</label>
++          <input type="number" id="redis-port" placeholder="6379" class="form-input">
++        </div>
++        <div class="form-group">
++          <label>Channel/Key</label>
++          <input type="text" id="redis-channel" placeholder="datasipper" class="form-input">
++        </div>
++        <div class="form-actions">
++          <button class="btn btn-primary" onclick="dataSipperApp.testRedisConnection()">Test</button>
++          <button class="btn btn-success" onclick="dataSipperApp.saveRedisConfig()">Save</button>
++        </div>
++      </div>
++    `;
++  }
++
++  testKafkaConnection() {
++    const config = {
++      servers: document.getElementById('kafka-servers').value,
++      topic: document.getElementById('kafka-topic').value,
++      clientId: document.getElementById('kafka-client-id').value
++    };
++    
++    this.sendMessage('testConnection', { type: 'kafka', config });
++    this.showTestModal('Testing Kafka connection...');
++  }
++
++  saveKafkaConfig() {
++    const config = {
++      servers: document.getElementById('kafka-servers').value,
++      topic: document.getElementById('kafka-topic').value,
++      clientId: document.getElementById('kafka-client-id').value
++    };
++    
++    this.sendMessage('configureOutput', { type: 'kafka', config });
++  }
++
++  testRedisConnection() {
++    const config = {
++      host: document.getElementById('redis-host').value,
++      port: parseInt(document.getElementById('redis-port').value),
++      channel: document.getElementById('redis-channel').value
++    };
++    
++    this.sendMessage('testConnection', { type: 'redis', config });
++    this.showTestModal('Testing Redis connection...');
++  }
++
++  saveRedisConfig() {
++    const config = {
++      host: document.getElementById('redis-host').value,
++      port: parseInt(document.getElementById('redis-port').value),
++      channel: document.getElementById('redis-channel').value
++    };
++    
++    this.sendMessage('configureOutput', { type: 'redis', config });
++  }
++
++  showTestModal(message) {
++    const modal = document.getElementById('test-modal');
++    const results = document.getElementById('test-results');
++    results.innerHTML = `<div class="loading">${message}</div>`;
++    this.showModal(modal);
++  }
++
++  testTransform() {
++    const code = document.getElementById('transform-code').value;
++    const testEvent = {
++      url: 'https://api.example.com/users/123',
++      method: 'GET',
++      status_code: 200,
++      timestamp: Date.now()
++    };
++    
++    try {
++      // Create function from code and test it
++      const transformFn = new Function('event', code + '\nreturn transform(event);');
++      const result = transformFn(testEvent);
++      
++      document.getElementById('transform-output').innerHTML = 
++        `<pre>${JSON.stringify(result, null, 2)}</pre>`;
++    } catch (error) {
++      document.getElementById('transform-output').innerHTML = 
++        `<pre class="error">Error: ${error.message}</pre>`;
++    }
++  }
++
++  saveTransform() {
++    const code = document.getElementById('transform-code').value;
++    this.sendMessage('saveTransform', { code });
++  }
++
++  // Utility methods
++  sendMessage(type, data) {
++    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
++      this.ws.send(JSON.stringify({ type, data }));
++    } else {
++      console.warn('WebSocket not connected, cannot send message:', type);
++    }
++  }
++
++  showModal(modal) {
++    modal.style.display = 'flex';
++  }
++
++  hideModal(modal) {
++    modal.style.display = 'none';
++  }
++
++  updateStatistics() {
++    document.getElementById('event-count').textContent = this.eventCache.size;
++    document.getElementById('stream-count').textContent = this.streamRules.size;
++  }
++
++  updateStatisticsDisplay(stats) {
++    if (stats.eventCount !== undefined) {
++      document.getElementById('event-count').textContent = stats.eventCount;
++    }
++    if (stats.streamCount !== undefined) {
++      document.getElementById('stream-count').textContent = stats.streamCount;
++    }
++  }
++
++  updateConnectionStatus(status) {
++    document.getElementById('output-status').textContent = status;
++    document.getElementById('output-status').className = 
++      `status-value ${status.toLowerCase()}`;
++  }
++
++  updateOutputStatus(outputName, status) {
++    const statusElement = document.getElementById(`${outputName}-status`);
++    if (statusElement) {
++      statusElement.textContent = status;
++      statusElement.className = `output-status ${status.toLowerCase()}`;
++    }
++  }
++
++  refreshData() {
++    this.loadInitialData();
++  }
++
++  loadInitialData() {
++    this.sendMessage('getNetworkEvents', { since: this.lastEventId });
++    this.sendMessage('getStreamRules', {});
++    this.sendMessage('getOutputConnectors', {});
++    this.sendMessage('getStatistics', {});
++  }
++
++  refreshEvents() {
++    const eventsList = document.getElementById('events-list');
++    eventsList.innerHTML = '';
++    
++    // Re-add all cached events
++    Array.from(this.eventCache.values())
++      .sort((a, b) => a.timestamp - b.timestamp)
++      .forEach(event => this.addEventToDisplay(event));
++  }
++
++  clearEvents() {
++    if (confirm('Clear all events from display?')) {
++      this.eventCache.clear();
++      document.getElementById('events-list').innerHTML = '';
++      this.sendMessage('clearEvents', {});
++    }
++  }
++
++  clearRuleForm() {
++    document.getElementById('rule-form').reset();
++    document.getElementById('conditions-container').innerHTML = '';
++  }
++
++  populateRuleForm(rule) {
++    document.getElementById('rule-name').value = rule.name;
++    document.getElementById('rule-description').value = rule.description;
++    document.getElementById('rule-logic').value = rule.logic;
++    document.getElementById('rule-group').value = rule.group;
++    document.getElementById('rule-output').value = rule.output;
++    
++    const conditionsContainer = document.getElementById('conditions-container');
++    conditionsContainer.innerHTML = '';
++    
++    rule.conditions.forEach(condition => {
++      this.addCondition(conditionsContainer);
++      const conditionElement = conditionsContainer.lastElementChild;
++      conditionElement.querySelector('.condition-field').value = condition.field;
++      conditionElement.querySelector('.condition-operator').value = condition.operator;
++      conditionElement.querySelector('.condition-value').value = condition.value;
++    });
++  }
++
++  loadTransformCode() {
++    this.sendMessage('getTransformCode', {});
++  }
++
++  showSettings() {
++    // TODO: Implement settings modal
++    console.log('Settings not yet implemented');
++  }
++}
++
++// Initialize the application when DOM is loaded
++let dataSipperApp;
++document.addEventListener('DOMContentLoaded', () => {
++  dataSipperApp = new DataSipperApp();
++});
++
++// Export for global access
++window.dataSipperApp = dataSipperApp;

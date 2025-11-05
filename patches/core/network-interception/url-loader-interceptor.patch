@@ -1,0 +1,130 @@
+# DataSipper: URLLoader request/response interceptor
+#
+# This patch implements the core network request interception functionality
+# by hooking into Chromium's URLLoader system to capture HTTP/HTTPS traffic.
+#
+# Affects:
+# - services/network/url_loader.cc
+# - services/network/url_loader.h
+# - services/network/network_context.cc
+# - content/browser/loader/navigation_url_loader_impl.cc
+
+--- a/services/network/url_loader.h
++++ b/services/network/url_loader.h
+@@ -35,6 +35,7 @@
+ #include "services/network/public/mojom/url_loader_factory.mojom.h"
+ #include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "services/network/resource_scheduler/resource_scheduler_client.h"
++#include "services/network/datasipper_network_observer.h"
+ 
+ namespace net {
+ class HttpResponseHeaders;
+@@ -268,6 +269,9 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) URLLoader
+   // Set to true if this URLLoader is being used for a CORS preflight request.
+   bool is_cors_preflight_ = false;
+ 
++  // DataSipper network observer for capturing requests/responses
++  std::unique_ptr<DataSipperNetworkObserver> datasipper_observer_;
++
+   base::WeakPtrFactory<URLLoader> weak_ptr_factory_{this};
+ };
+ 
+--- a/services/network/url_loader.cc
++++ b/services/network/url_loader.cc
+@@ -87,6 +87,7 @@
+ #include "services/network/sec_header_helpers.h"
+ #include "services/network/throttling/scoped_throttling_token.h"
+ #include "services/network/trust_tokens/trust_token_request_helper.h"
++#include "services/network/datasipper_network_observer.h"
+ #include "services/network/url_loader_factory.h"
+ #include "services/network/web_bundle_url_loader_factory.h"
+ #include "url/gurl.h"
+@@ -574,6 +575,11 @@ URLLoader::URLLoader(
+       factory_params.isolation_info, factory_params.disable_secure_dns,
+       factory_params.require_network_isolation_key);
+ 
++  // Initialize DataSipper network observer if enabled
++  if (base::FeatureList::IsEnabled(chrome::features::kDataSipperNetworkInterception)) {
++    datasipper_observer_ = std::make_unique<DataSipperNetworkObserver>();
++  }
++
+   url_request_->set_method(request.method);
+   url_request_->set_site_for_cookies(request.site_for_cookies);
+   url_request_->set_isolation_info(request.trusted_params
+@@ -738,6 +744,11 @@ void URLLoader::FollowRedirect(
+ }
+ 
+ void URLLoader::SetPriority(net::RequestPriority priority, int32_t intra_priority_value) {
++  // Notify DataSipper observer of priority changes
++  if (datasipper_observer_) {
++    datasipper_observer_->OnRequestPriorityChanged(url_request_.get(), priority);
++  }
++
+   if (url_request_ && url_request_->priority() != priority) {
+     url_request_->SetPriority(priority);
+   }
+@@ -1470,6 +1481,13 @@ void URLLoader::OnResponseStarted(net::URLRequest* url_request, int net_error) {
+     response->was_in_prefetch_cache = was_in_prefetch_cache_;
+   }
+ 
++  // Notify DataSipper observer of response start
++  if (datasipper_observer_) {
++    datasipper_observer_->OnResponseStarted(
++        url_request, 
++        response.get()
++    );
++  }
++
+   // Enforce the Cross-Origin-Embedder-Policy.
+   if (response->headers &&
+       !network::VerifyCrossOriginEmbedderPolicy(
+@@ -1680,6 +1698,12 @@ void URLLoader::ReadMore() {
+   DCHECK_EQ(0, bytes_read_);
+   DCHECK_NE(0, pending_write_buffer_size_);
+   DCHECK(response_body_stream_);
++  
++  // Notify DataSipper observer before reading
++  if (datasipper_observer_) {
++    datasipper_observer_->OnBeforeRead(url_request_.get(), pending_write_buffer_size_);
++  }
++
+   net::CompletionRepeatingCallback callback = base::BindRepeating(
+       &URLLoader::DidRead, weak_ptr_factory_.GetWeakPtr());
+ 
+@@ -1722,6 +1746,12 @@ void URLLoader::DidRead(int num_bytes) {
+ 
+   total_written_bytes_ += num_bytes;
+ 
++  // Notify DataSipper observer of data read
++  if (datasipper_observer_ && num_bytes > 0) {
++    datasipper_observer_->OnDataRead(
++        url_request_.get(), pending_write_buffer_.get(), num_bytes);
++  }
++
+   if (update_body_read_before_paused_)
+     update_body_read_before_paused_ = false;
+ 
+@@ -1885,6 +1915,11 @@ void URLLoader::OnReadCompleted(net::URLRequest* url_request, int bytes_read) {
+     RecordBodyReadFromNetBeforePausedMetrics();
+   }
+ 
++  // Notify DataSipper observer of read completion
++  if (datasipper_observer_) {
++    datasipper_observer_->OnReadCompleted(url_request, bytes_read);
++  }
++
+   if (bytes_read < 0) {
+     OnResponseCompleted(bytes_read);
+     return;
+@@ -1925,6 +1960,11 @@ void URLLoader::OnResponseCompleted(int error_code) {
+   if (network_usage_accumulator_)
+     network_usage_accumulator_->OnBytesTransferred(total_written_bytes_);
+ 
++  // Notify DataSipper observer of response completion
++  if (datasipper_observer_) {
++    datasipper_observer_->OnResponseCompleted(url_request_.get(), error_code);
++  }
++
+   URLLoaderCompletionStatus status;
+   status.error_code = error_code;
+   status.exists_in_cache = url_request_->was_cached();

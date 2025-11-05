@@ -1,0 +1,287 @@
+# DataSipper: Toolbar button implementation
+#
+# This patch implements the DataSipper toolbar button that toggles
+# the monitoring panel visibility.
+#
+# Affects:
+# - chrome/browser/ui/views/datasipper/datasipper_button.h (new file)
+# - chrome/browser/ui/views/datasipper/datasipper_button.cc (new file)
+# - chrome/browser/ui/views/datasipper/BUILD.gn (new file)
+
+--- /dev/null
++++ b/chrome/browser/ui/views/datasipper/BUILD.gn
+@@ -0,0 +1,42 @@
++# Copyright 2024 The DataSipper Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//build/config/features.gni")
++
++source_set("datasipper_ui") {
++  sources = [
++    "datasipper_button.cc",
++    "datasipper_button.h",
++    "datasipper_panel.cc", 
++    "datasipper_panel.h",
++    "datasipper_panel_web_ui.cc",
++    "datasipper_panel_web_ui.h",
++  ]
++
++  deps = [
++    "//base",
++    "//chrome/app:command_ids",
++    "//chrome/browser",
++    "//chrome/browser/ui",
++    "//chrome/browser/ui/views",
++    "//chrome/common",
++    "//components/datasipper",
++    "//content/public/browser",
++    "//ui/base",
++    "//ui/gfx",
++    "//ui/views",
++    "//url",
++  ]
++
++  public_deps = [
++    "//components/datasipper",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  
++  sources = [
++    "datasipper_button_unittest.cc",
++    "datasipper_panel_unittest.cc", 
++  ]
++
++  deps = [
++    ":datasipper_ui",
++    "//base/test:test_support",
++    "//chrome/test:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/datasipper/datasipper_button.h
+@@ -0,0 +1,68 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_BUTTON_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++
++class Browser;
++
++namespace content {
++class WebContents;
++}
++
++namespace datasipper {
++
++// Toolbar button that toggles the DataSipper monitoring panel.
++// Shows network activity indicators and provides quick access to monitoring.
++class DataSipperButton : public ToolbarButton {
++ public:
++  METADATA_HEADER(DataSipperButton);
++  
++  explicit DataSipperButton(Browser* browser);
++  ~DataSipperButton() override;
++
++  DataSipperButton(const DataSipperButton&) = delete;
++  DataSipperButton& operator=(const DataSipperButton&) = delete;
++
++  // ToolbarButton:
++  void UpdateIcon() override;
++  
++  // Updates button state based on current web contents
++  void UpdateForWebContents(content::WebContents* web_contents);
++  
++  // Updates activity indicator (e.g., when network events occur)
++  void UpdateActivityIndicator(bool has_activity);
++  
++  // Gets the button tooltip text
++  std::u16string GetTooltipText() const;
++
++ private:
++  // views::Button:
++  void OnThemeChanged() override;
++  
++  // ButtonListener:
++  void ButtonPressed();
++  
++  // Helper methods
++  void SetupButton();
++  gfx::ImageSkia GetButtonIcon() const;
++  SkColor GetIconColor() const;
++  void UpdateButtonState();
++  
++  raw_ptr<Browser> browser_;
++  raw_ptr<content::WebContents> current_web_contents_ = nullptr;
++  
++  bool has_network_activity_ = false;
++  bool panel_visible_ = false;
++  
++  base::WeakPtrFactory<DataSipperButton> weak_factory_{this};
++};
++
++}  // namespace datasipper
++
++#endif  // CHROME_BROWSER_UI_VIEWS_DATASIPPER_DATASIPPER_BUTTON_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/datasipper/datasipper_button.cc
+@@ -0,0 +1,144 @@
++// Copyright 2024 The DataSipper Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/views/datasipper/datasipper_button.h"
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/grit/generated_resources.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_palette.h"
++#include "ui/gfx/paint_vector_icon.h"
++#include "ui/views/controls/button/button_controller.h"
++
++namespace datasipper {
++
++namespace {
++
++// Vector icon for DataSipper button (network monitoring icon)
++const gfx::VectorIcon kDataSipperIcon = {
++    "datasipper_icon",
++    16,
++    "M 2,2 L 14,2 L 14,6 L 10,6 L 10,10 L 14,10 L 14,14 L 2,14 L 2,10 L 6,10 L 6,6 L 2,6 Z"
++};
++
++const gfx::VectorIcon kDataSipperActiveIcon = {
++    "datasipper_active_icon", 
++    16,
++    "M 2,2 L 14,2 L 14,6 L 10,6 L 10,10 L 14,10 L 14,14 L 2,14 L 2,10 L 6,10 L 6,6 L 2,6 Z M 8,8 L 8,8"
++};
++
++}  // namespace
++
++DataSipperButton::DataSipperButton(Browser* browser) : browser_(browser) {
++  SetupButton();
++  UpdateIcon();
++}
++
++DataSipperButton::~DataSipperButton() = default;
++
++void DataSipperButton::SetupButton() {
++  // Set up button properties
++  SetTooltipText(GetTooltipText());
++  SetAccessibleName(GetTooltipText());
++  
++  // Set up button controller and click handler
++  button_controller()->set_notify_action(
++      views::ButtonController::NotifyAction::kOnPress);
++  SetCallback(base::BindRepeating(&DataSipperButton::ButtonPressed,
++                                  base::Unretained(this)));
++                                  
++  // Enable the button
++  SetEnabled(true);
++}
++
++void DataSipperButton::UpdateIcon() {
++  const gfx::VectorIcon& icon = has_network_activity_ ? 
++      kDataSipperActiveIcon : kDataSipperIcon;
++  
++  SetImageModel(views::Button::STATE_NORMAL,
++                ui::ImageModel::FromVectorIcon(icon, GetIconColor()));
++}
++
++void DataSipperButton::UpdateForWebContents(content::WebContents* web_contents) {
++  current_web_contents_ = web_contents;
++  UpdateButtonState();
++}
++
++void DataSipperButton::UpdateActivityIndicator(bool has_activity) {
++  if (has_network_activity_ != has_activity) {
++    has_network_activity_ = has_activity;
++    UpdateIcon();
++  }
++}
++
++std::u16string DataSipperButton::GetTooltipText() const {
++  if (panel_visible_) {
++    return u"Hide DataSipper Network Monitor";
++  } else {
++    return u"Show DataSipper Network Monitor";
++  }
++}
++
++void DataSipperButton::OnThemeChanged() {
++  ToolbarButton::OnThemeChanged();
++  UpdateIcon();
++}
++
++void DataSipperButton::ButtonPressed() {
++  // Execute the toggle command
++  browser_->command_controller()->ExecuteCommand(IDC_DATASIPPER_TOGGLE);
++  
++  // Update button state
++  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser_);
++  if (browser_view) {
++    panel_visible_ = browser_view->IsDataSipperPanelVisible();
++    SetTooltipText(GetTooltipText());
++    SetPressed(panel_visible_);
++  }
++}
++
++gfx::ImageSkia DataSipperButton::GetButtonIcon() const {
++  const gfx::VectorIcon& icon = has_network_activity_ ? 
++      kDataSipperActiveIcon : kDataSipperIcon;
++  return gfx::CreateVectorIcon(icon, 16, GetIconColor());
++}
++
++SkColor DataSipperButton::GetIconColor() const {
++  if (has_network_activity_) {
++    // Use accent color for active state
++    return gfx::kGoogleBlue600;
++  } else if (panel_visible_) {
++    // Use pressed state color when panel is visible
++    return GetColorProvider()->GetColor(kColorToolbarButtonIconPressed);
++  } else {
++    // Use normal icon color
++    return GetColorProvider()->GetColor(kColorToolbarButtonIcon);
++  }
++}
++
++void DataSipperButton::UpdateButtonState() {
++  // Update button enabled state based on current page
++  bool should_enable = current_web_contents_ != nullptr;
++  
++  // Disable for certain special pages if needed
++  if (current_web_contents_) {
++    const GURL& url = current_web_contents_->GetLastCommittedURL();
++    if (url.SchemeIs("chrome") || url.SchemeIs("chrome-extension")) {
++      should_enable = false;
++    }
++  }
++  
++  SetEnabled(should_enable);
++}
++
++BEGIN_METADATA(DataSipperButton, ToolbarButton)
++END_METADATA
++
++}  // namespace datasipper

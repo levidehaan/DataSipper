@@ -1,0 +1,1172 @@
+# DataSipper: JavaScript frontend implementation
+#
+# This patch provides the JavaScript frontend code for the DataSipper WebUI
+# including real-time updates, stream configuration, and output management.
+#
+# Affects:
+# - chrome/browser/resources/datasipper/datasipper.js (new file)
+
+--- /dev/null
++++ b/chrome/browser/resources/datasipper/datasipper.js
+@@ -0,0 +1,850 @@
++/**
++ * DataSipper Frontend JavaScript
++ * Manages the WebUI interface for network monitoring and stream configuration
++ */
++
++class DataSipperApp {
++  constructor() {
++    this.events = [];
++    this.streamRules = [];
++    this.outputConnectors = {};
++    this.currentTab = 'events';
++    this.autoScroll = true;
++    this.pauseCapture = false;
++    this.eventFilter = 'all';
++    
++    // WebSocket connection for real-time updates
++    this.websocket = null;
++    this.reconnectAttempts = 0;
++    this.maxReconnectAttempts = 5;
++    
++    this.init();
++  }
++  
++  init() {
++    this.setupEventListeners();
++    this.setupTabNavigation();
++    this.setupModals();
++    this.connectWebSocket();
++    this.loadInitialData();
++    
++    // Auto-refresh every 5 seconds if not connected via WebSocket
++    setInterval(() => {
++      if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
++        this.refreshData();
++      }
++    }, 5000);
++  }
++  
++  setupEventListeners() {
++    // Header controls
++    document.getElementById('refresh-btn').addEventListener('click', () => {
++      this.refreshData();
++    });
++    
++    document.getElementById('clear-btn').addEventListener('click', () => {
++      this.clearEvents();
++    });
++    
++    document.getElementById('settings-btn').addEventListener('click', () => {
++      this.showSettings();
++    });
++    
++    // Event controls
++    document.getElementById('auto-scroll').addEventListener('change', (e) => {
++      this.autoScroll = e.target.checked;
++    });
++    
++    document.getElementById('pause-capture').addEventListener('change', (e) => {
++      this.pauseCapture = e.target.checked;
++    });
++    
++    document.getElementById('event-filter').addEventListener('change', (e) => {
++      this.eventFilter = e.target.value;
++      this.filterEvents();
++    });
++    
++    // Stream rules
++    document.getElementById('add-rule-btn').addEventListener('click', () => {
++      this.showRuleModal();
++    });
++    
++    // Condition management
++    document.getElementById('add-condition-btn').addEventListener('click', () => {
++      this.addConditionToModal();
++    });
++    
++    // Output configuration
++    document.getElementById('add-output-btn').addEventListener('click', () => {
++      this.showOutputModal();
++    });
++    
++    // Transform controls
++    document.getElementById('test-transform-btn').addEventListener('click', () => {
++      this.testTransform();
++    });
++    
++    document.getElementById('save-transform-btn').addEventListener('click', () => {
++      this.saveTransform();
++    });
++  }
++  
++  setupTabNavigation() {
++    const tabBtns = document.querySelectorAll('.tab-btn');
++    const tabPanels = document.querySelectorAll('.tab-panel');
++    
++    tabBtns.forEach(btn => {
++      btn.addEventListener('click', () => {
++        const tabId = btn.getAttribute('data-tab');
++        
++        // Update active tab button
++        tabBtns.forEach(b => b.classList.remove('active'));
++        btn.classList.add('active');
++        
++        // Update active tab panel
++        tabPanels.forEach(panel => panel.classList.remove('active'));
++        document.getElementById(`${tabId}-tab`).classList.add('active');
++        
++        this.currentTab = tabId;
++        this.onTabChanged(tabId);
++      });
++    });
++  }
++  
++  setupModals() {
++    // Close modal handlers
++    document.querySelectorAll('.modal-close').forEach(btn => {
++      btn.addEventListener('click', (e) => {
++        this.closeModal(e.target.closest('.modal'));
++      });
++    });
++    
++    // Click outside to close
++    document.querySelectorAll('.modal').forEach(modal => {
++      modal.addEventListener('click', (e) => {
++        if (e.target === modal) {
++          this.closeModal(modal);
++        }
++      });
++    });
++    
++    // Modal action buttons
++    document.querySelectorAll('[data-action="cancel"]').forEach(btn => {
++      btn.addEventListener('click', (e) => {
++        this.closeModal(e.target.closest('.modal'));
++      });
++    });
++    
++    document.querySelectorAll('[data-action="save"]').forEach(btn => {
++      btn.addEventListener('click', (e) => {
++        this.handleModalSave(e.target.closest('.modal'));
++      });
++    });
++  }
++  
++  connectWebSocket() {
++    try {
++      const wsUrl = `ws://${window.location.host}/datasipper/ws`;
++      this.websocket = new WebSocket(wsUrl);
++      
++      this.websocket.onopen = () => {
++        console.log('DataSipper WebSocket connected');
++        this.reconnectAttempts = 0;
++        this.updateConnectionStatus(true);
++      };
++      
++      this.websocket.onmessage = (event) => {
++        this.handleWebSocketMessage(JSON.parse(event.data));
++      };
++      
++      this.websocket.onclose = () => {
++        console.log('DataSipper WebSocket disconnected');
++        this.updateConnectionStatus(false);
++        this.scheduleReconnect();
++      };
++      
++      this.websocket.onerror = (error) => {
++        console.error('DataSipper WebSocket error:', error);
++      };
++    } catch (error) {
++      console.error('Failed to connect WebSocket:', error);
++      this.updateConnectionStatus(false);
++    }
++  }
++  
++  scheduleReconnect() {
++    if (this.reconnectAttempts < this.maxReconnectAttempts) {
++      const delay = Math.pow(2, this.reconnectAttempts) * 1000; // Exponential backoff
++      setTimeout(() => {
++        this.reconnectAttempts++;
++        this.connectWebSocket();
++      }, delay);
++    }
++  }
++  
++  handleWebSocketMessage(message) {
++    switch (message.type) {
++      case 'network_event':
++        if (!this.pauseCapture) {
++          this.addEvent(message.data);
++        }
++        break;
++      case 'stream_rule_added':
++        this.addStreamRule(message.data);
++        break;
++      case 'stream_rule_updated':
++        this.updateStreamRule(message.data);
++        break;
++      case 'stream_rule_removed':
++        this.removeStreamRule(message.data.name);
++        break;
++      case 'output_status_changed':
++        this.updateOutputStatus(message.data);
++        break;
++      default:
++        console.log('Unknown WebSocket message:', message);
++    }
++  }
++  
++  async loadInitialData() {
++    try {
++      await Promise.all([
++        this.loadEvents(),
++        this.loadStreamRules(),
++        this.loadOutputConnectors()
++      ]);
++    } catch (error) {
++      console.error('Failed to load initial data:', error);
++    }
++  }
++  
++  async loadEvents() {
++    try {
++      const response = await fetch('/datasipper/api/events');
++      const data = await response.json();
++      this.events = data.events || [];
++      this.renderEvents();
++      this.updateStats();
++    } catch (error) {
++      console.error('Failed to load events:', error);
++    }
++  }
++  
++  async loadStreamRules() {
++    try {
++      const response = await fetch('/datasipper/api/rules');
++      const data = await response.json();
++      this.streamRules = data.rules || [];
++      this.renderStreamRules();
++    } catch (error) {
++      console.error('Failed to load stream rules:', error);
++    }
++  }
++  
++  async loadOutputConnectors() {
++    try {
++      const response = await fetch('/datasipper/api/outputs');
++      const data = await response.json();
++      this.outputConnectors = data.outputs || {};
++      this.renderOutputConnectors();
++    } catch (error) {
++      console.error('Failed to load output connectors:', error);
++    }
++  }
++  
++  addEvent(event) {
++    this.events.unshift(event); // Add to beginning
++    
++    // Limit to 1000 events in memory
++    if (this.events.length > 1000) {
++      this.events = this.events.slice(0, 1000);
++    }
++    
++    if (this.currentTab === 'events') {
++      this.renderEvents();
++    }
++    
++    this.updateStats();
++  }
++  
++  renderEvents() {
++    const container = document.getElementById('events-list');
++    const filteredEvents = this.getFilteredEvents();
++    
++    if (filteredEvents.length === 0) {
++      container.innerHTML = '<div class="loading">No events captured yet</div>';
++      return;
++    }
++    
++    const html = filteredEvents.map(event => this.renderEventItem(event)).join('');
++    container.innerHTML = html;
++    
++    // Auto-scroll to top for new events
++    if (this.autoScroll) {
++      container.scrollTop = 0;
++    }
++    
++    // Add click handlers for event details
++    container.querySelectorAll('.event-item').forEach((item, index) => {
++      item.addEventListener('click', () => {
++        this.showEventDetails(filteredEvents[index]);
++      });
++    });
++  }
++  
++  renderEventItem(event) {
++    const timestamp = new Date(event.timestamp).toLocaleTimeString();
++    const type = event.type || 'http';
++    const method = event.method || 'GET';
++    const url = event.url || '';
++    const status = event.status_code || '';
++    const duration = event.duration_ms ? `${event.duration_ms}ms` : '';
++    
++    const statusClass = status >= 400 ? 'error' : 'success';
++    const indicatorClass = type === 'websocket' ? 'websocket' : 'http';
++    
++    return `
++      <div class="event-item" data-event-type="${type}">
++        <div class="event-indicator ${indicatorClass}"></div>
++        <div class="event-content">
++          <div class="event-main">
++            <span class="event-method">${method}</span>
++            <span class="event-url" title="${url}">${url}</span>
++            ${status ? `<span class="event-status ${statusClass}">${status}</span>` : ''}
++          </div>
++          <div class="event-meta">
++            <span>${timestamp}</span>
++            ${duration ? `<span>${duration}</span>` : ''}
++            ${event.stream_name ? `<span>Stream: ${event.stream_name}</span>` : ''}
++          </div>
++        </div>
++      </div>
++    `;
++  }
++  
++  getFilteredEvents() {
++    let filtered = this.events;
++    
++    switch (this.eventFilter) {
++      case 'http':
++        filtered = filtered.filter(e => e.type !== 'websocket');
++        break;
++      case 'websocket':
++        filtered = filtered.filter(e => e.type === 'websocket');
++        break;
++      case 'errors':
++        filtered = filtered.filter(e => e.status_code >= 400 || e.error_code !== 0);
++        break;
++    }
++    
++    return filtered;
++  }
++  
++  renderStreamRules() {
++    const container = document.getElementById('rules-list');
++    
++    if (this.streamRules.length === 0) {
++      container.innerHTML = '<div class="loading">No stream rules configured</div>';
++      return;
++    }
++    
++    const html = this.streamRules.map(rule => this.renderRuleItem(rule)).join('');
++    container.innerHTML = html;
++    
++    // Add event handlers
++    container.querySelectorAll('.rule-test-btn').forEach((btn, index) => {
++      btn.addEventListener('click', () => {
++        this.testStreamRule(this.streamRules[index]);
++      });
++    });
++    
++    container.querySelectorAll('.rule-edit-btn').forEach((btn, index) => {
++      btn.addEventListener('click', () => {
++        this.editStreamRule(this.streamRules[index]);
++      });
++    });
++    
++    container.querySelectorAll('.rule-delete-btn').forEach((btn, index) => {
++      btn.addEventListener('click', () => {
++        this.deleteStreamRule(this.streamRules[index].name);
++      });
++    });
++  }
++  
++  renderRuleItem(rule) {
++    const conditions = rule.conditions || [];
++    const conditionTags = conditions.map(c => {
++      const negateClass = c.negate ? ' negate' : '';
++      const displayText = c.value ? `${c.pattern}: ${c.value}` : c.pattern;
++      return `<span class="condition-tag${negateClass}" title="${c.type}: ${displayText}${c.negate ? ' (negated)' : ''}">${c.type.replace('_', ' ')}: ${displayText}</span>`;
++    }).join('');
++    
++    const logicMode = rule.logic_mode || 'AND';
++    const enabledStatus = rule.enabled !== false ? 'Enabled' : 'Disabled';
++    const enabledClass = rule.enabled !== false ? 'enabled' : 'disabled';
++    
++    return `
++      <div class="rule-item ${enabledClass}">
++        <div class="rule-header">
++          <div>
++            <div class="rule-name">${rule.name}</div>
++            <div class="rule-description">${rule.description || 'No description provided'}</div>
++          </div>
++          <div class="rule-actions">
++            <button class="btn btn-secondary rule-test-btn" title="Test rule with sample data">Test</button>
++            <button class="btn btn-secondary rule-edit-btn">Edit</button>
++            <button class="btn btn-secondary rule-delete-btn">Delete</button>
++          </div>
++        </div>
++        
++        <div class="rule-meta">
++          <span class="rule-logic">Logic: ${logicMode}</span>
++          <span class="rule-status ${enabledClass}">${enabledStatus}</span>
++          <span class="rule-conditions-count">${conditions.length} condition${conditions.length !== 1 ? 's' : ''}</span>
++        </div>
++        
++        <div class="rule-conditions">${conditionTags}</div>
++        
++        <div class="rule-stats">
++          <span>🎯 Group: ${rule.group_name || 'default'}</span>
++          <span>📤 Output: ${rule.output_target || 'default'}</span>
++          <span>📊 Matches: ${rule.match_count || 0}</span>
++          ${rule.last_match ? `<span>🕒 Last: ${new Date(rule.last_match).toLocaleTimeString()}</span>` : ''}
++        </div>
++      </div>
++    `;
++  }
++  
++  renderOutputConnectors() {
++    // Render Kafka configuration
++    this.renderKafkaConfig();
++    
++    // Render Redis configuration  
++    this.renderRedisConfig();
++    
++    // Update status indicators
++    this.updateOutputStatuses();
++  }
++  
++  renderKafkaConfig() {
++    const container = document.getElementById('kafka-config');
++    const config = this.outputConnectors.kafka || {};
++    
++    container.innerHTML = `
++      <div class="form-group">
++        <label>Bootstrap Servers</label>
++        <input type="text" class="form-input" id="kafka-servers" 
++               value="${config.bootstrap_servers || 'localhost:9092'}" 
++               placeholder="localhost:9092">
++      </div>
++      
++      <div class="form-group">
++        <label>Default Topic</label>
++        <input type="text" class="form-input" id="kafka-topic" 
++               value="${config.default_topic || 'datasipper-events'}" 
++               placeholder="datasipper-events">
++      </div>
++      
++      <div class="form-group">
++        <label>Security Protocol</label>
++        <select class="form-input" id="kafka-security">
++          <option value="PLAINTEXT" ${config.security_protocol === 'PLAINTEXT' ? 'selected' : ''}>PLAINTEXT</option>
++          <option value="SSL" ${config.security_protocol === 'SSL' ? 'selected' : ''}>SSL</option>
++          <option value="SASL_PLAINTEXT" ${config.security_protocol === 'SASL_PLAINTEXT' ? 'selected' : ''}>SASL_PLAINTEXT</option>
++          <option value="SASL_SSL" ${config.security_protocol === 'SASL_SSL' ? 'selected' : ''}>SASL_SSL</option>
++        </select>
++      </div>
++      
++      <div class="form-group">
++        <button class="btn btn-primary" onclick="app.testKafkaConnection()">Test Connection</button>
++        <button class="btn btn-success" onclick="app.saveKafkaConfig()">Save Configuration</button>
++      </div>
++    `;
++  }
++  
++  renderRedisConfig() {
++    const container = document.getElementById('redis-config');
++    const config = this.outputConnectors.redis || {};
++    
++    container.innerHTML = `
++      <div class="form-group">
++        <label>Host</label>
++        <input type="text" class="form-input" id="redis-host" 
++               value="${config.host || 'localhost'}" 
++               placeholder="localhost">
++      </div>
++      
++      <div class="form-group">
++        <label>Port</label>
++        <input type="number" class="form-input" id="redis-port" 
++               value="${config.port || 6379}" 
++               placeholder="6379">
++      </div>
++      
++      <div class="form-group">
++        <label>Database</label>
++        <input type="number" class="form-input" id="redis-database" 
++               value="${config.database || 0}" 
++               placeholder="0">
++      </div>
++      
++      <div class="form-group">
++        <label>Password</label>
++        <input type="password" class="form-input" id="redis-password" 
++               value="${config.password || ''}" 
++               placeholder="Optional">
++      </div>
++      
++      <div class="form-group">
++        <button class="btn btn-primary" onclick="app.testRedisConnection()">Test Connection</button>
++        <button class="btn btn-success" onclick="app.saveRedisConfig()">Save Configuration</button>
++      </div>
++    `;
++  }
++  
++  updateStats() {
++    document.getElementById('event-count').textContent = this.events.length;
++    document.getElementById('stream-count').textContent = this.streamRules.length;
++  }
++  
++  updateConnectionStatus(connected) {
++    const statusEl = document.getElementById('output-status');
++    statusEl.textContent = connected ? 'Connected' : 'Disconnected';
++    statusEl.className = `status-value ${connected ? 'connected' : 'disconnected'}`;
++  }
++  
++  updateOutputStatuses() {
++    // Update Kafka status
++    const kafkaStatus = document.getElementById('kafka-status');
++    const kafkaConnected = this.outputConnectors.kafka?.connected || false;
++    kafkaStatus.textContent = kafkaConnected ? 'Connected' : 'Disconnected';
++    kafkaStatus.className = `output-status ${kafkaConnected ? 'connected' : 'disconnected'}`;
++    
++    // Update Redis status
++    const redisStatus = document.getElementById('redis-status');
++    const redisConnected = this.outputConnectors.redis?.connected || false;
++    redisStatus.textContent = redisConnected ? 'Connected' : 'Disconnected';
++    redisStatus.className = `output-status ${redisConnected ? 'connected' : 'disconnected'}`;
++  }
++  
++  onTabChanged(tabId) {
++    switch (tabId) {
++      case 'events':
++        this.renderEvents();
++        break;
++      case 'streams':
++        this.renderStreamRules();
++        break;
++      case 'outputs':
++        this.renderOutputConnectors();
++        break;
++      case 'transform':
++        this.loadTransformCode();
++        break;
++    }
++  }
++  
++  showEventDetails(event) {
++    // Create and show event details modal
++    const modal = document.createElement('div');
++    modal.className = 'modal active';
++    modal.innerHTML = `
++      <div class="modal-content">
++        <div class="modal-header">
++          <h2>Event Details</h2>
++          <button class="modal-close">&times;</button>
++        </div>
++        <div class="modal-body">
++          <pre>${JSON.stringify(event, null, 2)}</pre>
++        </div>
++      </div>
++    `;
++    
++    document.body.appendChild(modal);
++    
++    // Set up close handler
++    modal.querySelector('.modal-close').addEventListener('click', () => {
++      document.body.removeChild(modal);
++    });
++    
++    modal.addEventListener('click', (e) => {
++      if (e.target === modal) {
++        document.body.removeChild(modal);
++      }
++    });
++  }
++  
++  showRuleModal(rule = null) {
++    const modal = document.getElementById('rule-modal');
++    const title = document.getElementById('rule-modal-title');
++    
++    title.textContent = rule ? 'Edit Stream Rule' : 'Create Stream Rule';
++    
++    if (rule) {
++      // Populate form with existing rule data
++      document.getElementById('rule-name').value = rule.name;
++      document.getElementById('rule-description').value = rule.description || '';
++      document.getElementById('rule-group').value = rule.group_name || '';
++      document.getElementById('rule-output').value = rule.output_target || '';
++      document.getElementById('rule-logic').value = rule.logic_mode || 'AND';
++      
++      // Populate conditions
++      this.clearConditions();
++      if (rule.conditions) {
++        rule.conditions.forEach(condition => {
++          this.addConditionToModal(condition);
++        });
++      }
++    } else {
++      // Clear form
++      document.getElementById('rule-form').reset();
++      this.clearConditions();
++      // Add one default condition
++      this.addConditionToModal();
++    }
++    
++    this.showModal(modal);
++  }
++  
++  editStreamRule(rule) {
++    this.showRuleModal(rule);
++  }
++  
++  addConditionToModal(condition = null) {
++    const container = document.getElementById('conditions-container');
++    const conditionIndex = container.children.length;
++    
++    const conditionDiv = document.createElement('div');
++    conditionDiv.className = 'condition-item';
++    conditionDiv.setAttribute('data-condition-index', conditionIndex);
++    
++    conditionDiv.innerHTML = `
++      <div class="condition-row">
++        <select class="condition-type form-input">
++          <option value="URL_PATTERN" ${condition?.type === 'URL_PATTERN' ? 'selected' : ''}>URL Pattern</option>
++          <option value="HOST_EXACT" ${condition?.type === 'HOST_EXACT' ? 'selected' : ''}>Exact Host</option>
++          <option value="PATH_PREFIX" ${condition?.type === 'PATH_PREFIX' ? 'selected' : ''}>Path Prefix</option>
++          <option value="METHOD_EXACT" ${condition?.type === 'METHOD_EXACT' ? 'selected' : ''}>HTTP Method</option>
++          <option value="HEADER_CONTAINS" ${condition?.type === 'HEADER_CONTAINS' ? 'selected' : ''}>Header Contains</option>
++          <option value="STATUS_CODE" ${condition?.type === 'STATUS_CODE' ? 'selected' : ''}>Status Code</option>
++          <option value="CONTENT_TYPE" ${condition?.type === 'CONTENT_TYPE' ? 'selected' : ''}>Content Type</option>
++          <option value="WEBSOCKET_PROTOCOL" ${condition?.type === 'WEBSOCKET_PROTOCOL' ? 'selected' : ''}>WebSocket Protocol</option>
++        </select>
++        
++        <input type="text" class="condition-pattern form-input" 
++               placeholder="Pattern or value" 
++               value="${condition?.pattern || ''}" />
++        
++        <input type="text" class="condition-value form-input" 
++               placeholder="Expected value (if needed)" 
++               value="${condition?.value || ''}" 
++               style="display: ${this.needsValueField(condition?.type) ? 'block' : 'none'}" />
++        
++        <label class="checkbox-label">
++          <input type="checkbox" class="condition-negate" ${condition?.negate ? 'checked' : ''}>
++          Negate
++        </label>
++        
++        <button type="button" class="btn btn-danger condition-remove" onclick="this.parentElement.parentElement.remove()">
++          ✕
++        </button>
++      </div>
++      
++      <div class="condition-examples">
++        <small class="condition-help">${this.getConditionHelp(condition?.type || 'URL_PATTERN')}</small>
++      </div>
++    `;
++    
++    container.appendChild(conditionDiv);
++    
++    // Add event listener for type changes
++    const typeSelect = conditionDiv.querySelector('.condition-type');
++    const valueInput = conditionDiv.querySelector('.condition-value');
++    const helpText = conditionDiv.querySelector('.condition-help');
++    
++    typeSelect.addEventListener('change', () => {
++      const needsValue = this.needsValueField(typeSelect.value);
++      valueInput.style.display = needsValue ? 'block' : 'none';
++      helpText.textContent = this.getConditionHelp(typeSelect.value);
++    });
++  }
++  
++  clearConditions() {
++    const container = document.getElementById('conditions-container');
++    container.innerHTML = '';
++  }
++  
++  needsValueField(conditionType) {
++    return ['HEADER_CONTAINS', 'STATUS_CODE', 'CONTENT_TYPE'].includes(conditionType);
++  }
++  
++  getConditionHelp(conditionType) {
++    const helpTexts = {
++      'URL_PATTERN': 'Examples: *.api.example.com/*, /api/users/*, https://example.com/*',
++      'HOST_EXACT': 'Examples: api.example.com, localhost:3000',
++      'PATH_PREFIX': 'Examples: /api/, /webhooks/, /v1/users/',
++      'METHOD_EXACT': 'Examples: GET, POST, PUT, DELETE, PATCH',
++      'HEADER_CONTAINS': 'Pattern: header name, Value: expected content',
++      'STATUS_CODE': 'Examples: 200, 404, 5xx (use pattern for ranges)',
++      'CONTENT_TYPE': 'Examples: application/json, text/html, image/*',
++      'WEBSOCKET_PROTOCOL': 'Examples: chat, notifications, graphql-ws'
++    };
++    return helpTexts[conditionType] || 'Enter the pattern to match against';
++  }
++  
++  showModal(modal) {
++    modal.classList.add('active');
++  }
++  
++  closeModal(modal) {
++    modal.classList.remove('active');
++  }
++  
++  handleModalSave(modal) {
++    const modalId = modal.id;
++    
++    switch (modalId) {
++      case 'rule-modal':
++        this.saveStreamRule();
++        break;
++      default:
++        console.log('Unknown modal save:', modalId);
++    }
++    
++    this.closeModal(modal);
++  }
++  
++  async saveStreamRule() {
++    const name = document.getElementById('rule-name').value;
++    const description = document.getElementById('rule-description').value;
++    const group = document.getElementById('rule-group').value;
++    const output = document.getElementById('rule-output').value;
++    const logicMode = document.getElementById('rule-logic').value;
++    
++    // Collect conditions from UI
++    const conditions = [];
++    const conditionItems = document.querySelectorAll('.condition-item');
++    
++    conditionItems.forEach(item => {
++      const type = item.querySelector('.condition-type').value;
++      const pattern = item.querySelector('.condition-pattern').value;
++      const value = item.querySelector('.condition-value').value;
++      const negate = item.querySelector('.condition-negate').checked;
++      
++      if (type && pattern) {
++        conditions.push({
++          type,
++          pattern,
++          value: value || undefined,
++          negate,
++          case_sensitive: false // Default for now
++        });
++      }
++    });
++    
++    if (conditions.length === 0) {
++      alert('Please add at least one condition for the routing rule.');
++      return;
++    }
++    
++    const rule = {
++      name,
++      description,
++      group_name: group,
++      output_target: output,
++      logic_mode: logicMode,
++      conditions
++    };
++    
++    try {
++      const response = await fetch('/datasipper/api/rules', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(rule)
++      });
++      
++      if (response.ok) {
++        this.loadStreamRules(); // Reload rules
++      } else {
++        console.error('Failed to save rule');
++      }
++    } catch (error) {
++      console.error('Error saving rule:', error);
++    }
++  }
++  
++  async deleteStreamRule(ruleName) {
++    if (!confirm(`Delete rule "${ruleName}"?`)) {
++      return;
++    }
++    
++    try {
++      const response = await fetch(`/datasipper/api/rules/${ruleName}`, {
++        method: 'DELETE'
++      });
++      
++      if (response.ok) {
++        this.loadStreamRules(); // Reload rules
++      } else {
++        console.error('Failed to delete rule');
++      }
++    } catch (error) {
++      console.error('Error deleting rule:', error);
++    }
++  }
++  
++  async testStreamRule(rule) {
++    // Create sample test data
++    const sampleEvents = [
++      {
++        type: 'http_request',
++        method: 'GET',
++        url: 'https://api.example.com/users/123',
++        status_code: 200,
++        headers: { 'Content-Type': 'application/json' },
++        timestamp: Date.now()
++      },
++      {
++        type: 'http_request',
++        method: 'POST',
++        url: 'https://api.example.com/orders',
++        status_code: 201,
++        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer token123' },
++        timestamp: Date.now()
++      },
++      {
++        type: 'websocket',
++        url: 'wss://chat.example.com/ws',
++        subprotocol: 'chat',
++        timestamp: Date.now()
++      },
++      {
++        type: 'http_request',
++        method: 'GET',
++        url: 'https://cdn.example.com/images/logo.png',
++        status_code: 200,
++        headers: { 'Content-Type': 'image/png' },
++        timestamp: Date.now()
++      }
++    ];
++    
++    try {
++      const response = await fetch('/datasipper/api/rules/test', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ rule, events: sampleEvents })
++      });
++      
++      const result = await response.json();
++      this.showRuleTestResult(rule.name, result);
++    } catch (error) {
++      this.showRuleTestResult(rule.name, { 
++        success: false, 
++        error: error.message,
++        matches: []
++      });
++    }
++  }
++  
++  showRuleTestResult(ruleName, result) {
++    const modal = document.createElement('div');
++    modal.className = 'modal active';
++    modal.innerHTML = `
++      <div class="modal-content" style="max-width: 700px;">
++        <div class="modal-header">
++          <h2>Rule Test Results: ${ruleName}</h2>
++          <button class="modal-close">&times;</button>
++        </div>
++        <div class="modal-body">
++          ${result.success ? this.renderTestResults(result) : `<div class="test-error">Error: ${result.error}</div>`}
++        </div>
++        <div class="modal-footer">
++          <button class="btn btn-secondary" onclick="document.body.removeChild(this.closest('.modal'))">Close</button>
++        </div>
++      </div>
++    `;
++    
++    document.body.appendChild(modal);
++    
++    // Set up close handler
++    modal.querySelector('.modal-close').addEventListener('click', () => {
++      document.body.removeChild(modal);
++    });
++    
++    modal.addEventListener('click', (e) => {
++      if (e.target === modal) {
++        document.body.removeChild(modal);
++      }
++    });
++  }
++  
++  renderTestResults(result) {
++    const matches = result.matches || [];
++    const total = result.total_tested || 0;
++    
++    return `
++      <div class="test-summary">
++        <h3>Test Summary</h3>
++        <div class="test-stats">
++          <span class="stat-item">📊 Total Events: ${total}</span>
++          <span class="stat-item">✅ Matches: ${matches.length}</span>
++          <span class="stat-item">❌ Non-matches: ${total - matches.length}</span>
++        </div>
++      </div>
++      
++      ${matches.length > 0 ? `
++        <div class="test-matches">
++          <h3>Matching Events</h3>
++          ${matches.map((match, index) => `
++            <div class="test-match-item">
++              <div class="match-event">
++                <strong>${match.event.method || match.event.type} ${match.event.url}</strong>
++                ${match.event.status_code ? `<span class="status-code">${match.event.status_code}</span>` : ''}
++              </div>
++              <div class="match-conditions">
++                Matched conditions: ${match.matched_conditions.join(', ')}
++              </div>
++            </div>
++          `).join('')}
++        </div>
++      ` : ''}
++      
++      <div class="test-sample-data">
++        <h3>Sample Test Data</h3>
++        <details>
++          <summary>View test events (${total} events)</summary>
++          <pre>${JSON.stringify(result.test_events || [], null, 2)}</pre>
++        </details>
++      </div>
++    `;
++  }
++  
++  async testKafkaConnection() {
++    const config = this.getKafkaConfig();
++    
++    try {
++      const response = await fetch('/datasipper/api/outputs/kafka/test', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(config)
++      });
++      
++      const result = await response.json();
++      this.showTestResult('Kafka', result);
++    } catch (error) {
++      this.showTestResult('Kafka', { success: false, error: error.message });
++    }
++  }
++  
++  async testRedisConnection() {
++    const config = this.getRedisConfig();
++    
++    try {
++      const response = await fetch('/datasipper/api/outputs/redis/test', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(config)
++      });
++      
++      const result = await response.json();
++      this.showTestResult('Redis', result);
++    } catch (error) {
++      this.showTestResult('Redis', { success: false, error: error.message });
++    }
++  }
++  
++  showTestResult(type, result) {
++    const modal = document.getElementById('test-modal');
++    const resultsEl = document.getElementById('test-results');
++    
++    const status = result.success ? 'Success' : 'Failed';
++    const statusClass = result.success ? 'success' : 'error';
++    
++    resultsEl.innerHTML = `
++      <div class="test-result ${statusClass}">
++        <h3>${type} Connection Test: ${status}</h3>
++        ${result.error ? `<p>Error: ${result.error}</p>` : ''}
++        ${result.details ? `<pre>${JSON.stringify(result.details, null, 2)}</pre>` : ''}
++      </div>
++    `;
++    
++    this.showModal(modal);
++  }
++  
++  getKafkaConfig() {
++    return {
++      bootstrap_servers: document.getElementById('kafka-servers').value,
++      default_topic: document.getElementById('kafka-topic').value,
++      security_protocol: document.getElementById('kafka-security').value
++    };
++  }
++  
++  getRedisConfig() {
++    return {
++      host: document.getElementById('redis-host').value,
++      port: parseInt(document.getElementById('redis-port').value),
++      database: parseInt(document.getElementById('redis-database').value),
++      password: document.getElementById('redis-password').value || undefined
++    };
++  }
++  
++  async saveKafkaConfig() {
++    const config = this.getKafkaConfig();
++    
++    try {
++      const response = await fetch('/datasipper/api/outputs/kafka/config', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(config)
++      });
++      
++      if (response.ok) {
++        this.showNotification('Kafka configuration saved');
++        this.loadOutputConnectors(); // Reload to get updated status
++      } else {
++        this.showNotification('Failed to save Kafka configuration', 'error');
++      }
++    } catch (error) {
++      this.showNotification('Error saving Kafka configuration', 'error');
++    }
++  }
++  
++  async saveRedisConfig() {
++    const config = this.getRedisConfig();
++    
++    try {
++      const response = await fetch('/datasipper/api/outputs/redis/config', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify(config)
++      });
++      
++      if (response.ok) {
++        this.showNotification('Redis configuration saved');
++        this.loadOutputConnectors(); // Reload to get updated status
++      } else {
++        this.showNotification('Failed to save Redis configuration', 'error');
++      }
++    } catch (error) {
++      this.showNotification('Error saving Redis configuration', 'error');
++    }
++  }
++  
++  loadTransformCode() {
++    // Load existing transform code
++    fetch('/datasipper/api/transform')
++      .then(response => response.json())
++      .then(data => {
++        document.getElementById('transform-code').value = data.code || '';
++      })
++      .catch(error => {
++        console.error('Failed to load transform code:', error);
++      });
++  }
++  
++  async testTransform() {
++    const code = document.getElementById('transform-code').value;
++    const outputEl = document.getElementById('transform-output');
++    
++    // Use a sample event for testing
++    const sampleEvent = {
++      type: 'http_request',
++      method: 'POST',
++      url: 'https://api.example.com/users/123/orders',
++      status_code: 200,
++      timestamp: Date.now(),
++      headers: { 'Content-Type': 'application/json' },
++      body: '{"order_id": 456, "amount": 99.99}'
++    };
++    
++    try {
++      const response = await fetch('/datasipper/api/transform/test', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ code, event: sampleEvent })
++      });
++      
++      const result = await response.json();
++      
++      if (result.success) {
++        outputEl.innerHTML = `<pre>${JSON.stringify(result.transformed, null, 2)}</pre>`;
++      } else {
++        outputEl.innerHTML = `<pre style="color: var(--ds-danger)">Error: ${result.error}</pre>`;
++      }
++    } catch (error) {
++      outputEl.innerHTML = `<pre style="color: var(--ds-danger)">Error: ${error.message}</pre>`;
++    }
++  }
++  
++  async saveTransform() {
++    const code = document.getElementById('transform-code').value;
++    
++    try {
++      const response = await fetch('/datasipper/api/transform', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ code })
++      });
++      
++      if (response.ok) {
++        this.showNotification('Transform code saved');
++      } else {
++        this.showNotification('Failed to save transform code', 'error');
++      }
++    } catch (error) {
++      this.showNotification('Error saving transform code', 'error');
++    }
++  }
++  
++  showNotification(message, type = 'success') {
++    // Create notification element
++    const notification = document.createElement('div');
++    notification.className = `notification ${type}`;
++    notification.textContent = message;
++    notification.style.cssText = `
++      position: fixed;
++      top: 20px;
++      right: 20px;
++      padding: 12px 16px;
++      background: ${type === 'success' ? 'var(--ds-success)' : 'var(--ds-danger)'};
++      color: white;
++      border-radius: var(--ds-radius-md);
++      box-shadow: var(--ds-shadow-lg);
++      z-index: 1001;
++      animation: slideIn 0.3s ease-out;
++    `;
++    
++    document.body.appendChild(notification);
++    
++    // Auto-remove after 3 seconds
++    setTimeout(() => {
++      notification.style.animation = 'fadeOut 0.3s ease-out';
++      setTimeout(() => {
++        if (notification.parentNode) {
++          document.body.removeChild(notification);
++        }
++      }, 300);
++    }, 3000);
++  }
++  
++  async refreshData() {
++    await this.loadInitialData();
++    this.showNotification('Data refreshed');
++  }
++  
++  clearEvents() {
++    if (confirm('Clear all captured events?')) {
++      this.events = [];
++      this.renderEvents();
++      this.updateStats();
++      this.showNotification('Events cleared');
++    }
++  }
++  
++  filterEvents() {
++    this.renderEvents();
++  }
++  
++  showSettings() {
++    // TODO: Implement settings modal
++    this.showNotification('Settings coming soon!');
++  }
++}
++
++// Initialize the app when DOM is loaded
++let app;
++document.addEventListener('DOMContentLoaded', () => {
++  app = new DataSipperApp();
++});
++
++// Export for global access
++window.DataSipperApp = DataSipperApp;

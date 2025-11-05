@@ -1,0 +1,148 @@
+# DataSipper: Network stack compatibility and safety
+#
+# This patch ensures DataSipper's network interception is compatible with
+# Chromium's security model and doesn't interfere with core functionality.
+#
+# Affects:
+# - services/network/network_context.cc
+# - net/url_request/url_request.h
+
+--- a/services/network/network_context.cc
++++ b/services/network/network_context.cc
+@@ -109,6 +109,7 @@
+ #include "services/network/url_loader.h"
+ #include "services/network/url_loader_factory.h"
+ #include "services/network/url_request_context_builder_mojo.h"
++#include "services/network/datasipper_network_observer.h"
+ #include "services/network/web_bundle_url_loader_factory.h"
+ #include "url/gurl.h"
+ #include "url/scheme_host_port.h"
+@@ -382,6 +383,11 @@ NetworkContext::NetworkContext(
+   }
+ #endif  // BUILDFLAG(IS_CT_SUPPORTED)
+ 
++  // Initialize DataSipper network monitoring if enabled
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  datasipper_enabled_ = params_->enable_datasipper_monitoring;
++#endif
++
+   url_request_context_ = builder.Build();
+ 
+   network_service_->RegisterNetworkContext(this);
+@@ -3293,6 +3299,19 @@ void NetworkContext::SetNetworkConditions(
+   throttling_controller_->SetConditions(std::move(conditions));
+ }
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++void NetworkContext::SetDataSipperEnabled(bool enabled) {
++  datasipper_enabled_ = enabled;
++}
++
++void NetworkContext::AddNetworkServiceObserver(
++    mojo::PendingRemote<mojom::NetworkServiceObserver> observer) {
++  network_service_observers_.Add(std::move(observer));
++}
++#endif  // BUILDFLAG(ENABLE_DATASIPPER)
++
+ #if BUILDFLAG(IS_ANDROID)
+ void NetworkContext::DumpWithoutCrashing(base::Time dump_request_time) {
+   static auto* const kMaxDumpTimeMetric = base::Histogram::FactoryTimeGet(
+--- a/services/network/network_context.h
++++ b/services/network/network_context.h
+@@ -63,6 +63,10 @@
+ #include "services/network/public/mojom/network_context.mojom.h"
+ #include "services/network/public/mojom/network_service.mojom.h"
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++#include "mojo/public/cpp/bindings/remote_set.h"
++#endif
++
+ namespace base {
+ class UnguessableToken;
+ }  // namespace base
+@@ -346,6 +350,13 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkContext
+   void SetNetworkConditions(const base::UnguessableToken& throttling_profile_id,
+                            mojom::NetworkConditionsPtr conditions) override;
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  // DataSipper integration
++  void SetDataSipperEnabled(bool enabled) override;
++  void AddNetworkServiceObserver(
++      mojo::PendingRemote<mojom::NetworkServiceObserver> observer) override;
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+   void DumpWithoutCrashing(base::Time dump_request_time) override;
+ #endif
+@@ -596,6 +607,11 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkContext
+   // Used by SetNetworkConditions() and ClearNetworkConditions().
+   std::unique_ptr<ThrottlingController> throttling_controller_;
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  bool datasipper_enabled_ = false;
++  mojo::RemoteSet<mojom::NetworkServiceObserver> network_service_observers_;
++#endif
++
+   base::WeakPtrFactory<NetworkContext> weak_factory_{this};
+ };
+ 
+--- a/net/url_request/url_request.h
++++ b/net/url_request/url_request.h
+@@ -49,6 +49,10 @@ class HttpResponseInfo;
+ class SSLInfo;
+ }
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++namespace datasipper { class NetworkEvent; }
++#endif
++
+ namespace url {
+ class SchemeHostPort;
+ }
+@@ -843,6 +847,13 @@ class NET_EXPORT URLRequest : public base::SupportsUserData {
+   // Called when the request is being destroyed.
+   void OnDestroy();
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  // DataSipper integration points
++  void NotifyDataSipperRequestStart();
++  void NotifyDataSipperResponseReceived();
++  void NotifyDataSipperRequestComplete();
++#endif
++
+  private:
+   friend class URLRequestContext;
+ 
+@@ -916,6 +927,10 @@ class NET_EXPORT URLRequest : public base::SupportsUserData {
+   // True if this URLRequest is for a download.
+   bool is_for_download_ = false;
+ 
++#if BUILDFLAG(ENABLE_DATASIPPER)
++  bool datasipper_monitoring_enabled_ = false;
++#endif
++
+   // Network traffic annotation for this URL request.
+   net::MutableNetworkTrafficAnnotationTag traffic_annotation_;
+ 
+--- a/services/network/public/mojom/network_context.mojom
++++ b/services/network/public/mojom/network_context.mojom
+@@ -1340,6 +1340,15 @@ interface NetworkContext {
+   // Sets network conditions to emulate. The |throttling_profile_id| should be
+   // unique.
+   SetNetworkConditions(mojo_base.mojom.UnguessableToken throttling_profile_id,
+                       NetworkConditions? conditions);
++
++  [EnableIf=enable_datasipper]
++  // DataSipper network monitoring controls
++  SetDataSipperEnabled(bool enabled);
++  
++  [EnableIf=enable_datasipper]
++  // Add observer for DataSipper network events
++  AddNetworkServiceObserver(pending_remote<NetworkServiceObserver> observer);
+ };
++
++[EnableIf=enable_datasipper]
++interface NetworkServiceObserver {
++  // Called when DataSipper captures a network event
++  OnDataSipperNetworkEvent(string event_data);
++};
