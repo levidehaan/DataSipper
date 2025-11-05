@@ -49,6 +49,25 @@ class DataSipperPageHandler : public side_panel::mojom::DataSipperPageHandler {
   void AddObserver(mojo::PendingRemote<side_panel::mojom::DataSipperObserver>
                        observer) override;
 
+  // Stream management methods
+  void GetDetectedStreams(GetDetectedStreamsCallback callback) override;
+  void GetStreamDetails(const std::string& stream_id,
+                        GetStreamDetailsCallback callback) override;
+  void GetStreamEvents(const std::string& stream_id,
+                       int32_t limit,
+                       GetStreamEventsCallback callback) override;
+  void SubscribeToStream(const std::string& stream_id,
+                         SubscribeToStreamCallback callback) override;
+  void UnsubscribeFromStream(const std::string& subscription_id,
+                             UnsubscribeFromStreamCallback callback) override;
+  void SetStreamActive(const std::string& stream_id,
+                       bool active,
+                       SetStreamActiveCallback callback) override;
+  void DeleteStream(const std::string& stream_id,
+                    DeleteStreamCallback callback) override;
+  void ExportStreamAsWorkflow(const std::string& stream_id,
+                              ExportStreamAsWorkflowCallback callback) override;
+
   // Called by DataSipperService to forward real network data to JavaScript
   void SendNetworkRequest(side_panel::mojom::NetworkRequestDataPtr request);
 
