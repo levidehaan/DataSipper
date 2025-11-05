@@ -9,6 +9,10 @@ component("streaming") {
   sources = [
     "dom_stream_tracker.cc",
     "dom_stream_tracker.h",
+    "stream_database_sync.cc",
+    "stream_database_sync.h",
+    "stream_registry.cc",
+    "stream_registry.h",
     "stream_types.cc",
     "stream_types.h",
   ]
@@ -24,6 +28,7 @@ component("streaming") {
   deps = [
     "//base",
     "//content/public/browser",
+    "//sql",
     "//url",
   ]
 
