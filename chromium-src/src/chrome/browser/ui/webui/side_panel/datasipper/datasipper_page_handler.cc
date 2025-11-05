@@ -4,6 +4,7 @@
 
 #include "chrome/browser/ui/webui/side_panel/datasipper/datasipper_page_handler.h"
 
+#include "base/json/json_writer.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
 #include "chrome/browser/datasipper/datasipper_network_bridge.h"
@@ -113,9 +114,9 @@ void DataSipperPageHandler::GetDetectedStreams(
 
   if (service && service->stream_registry()) {
     // Get all streams from the registry
-    const auto& all_streams = service->stream_registry()->GetAllStreams();
+    const auto all_streams = service->stream_registry()->GetAllStreams();
 
-    for (const auto& [stream_id, stream_def] : all_streams) {
+    for (const auto& stream_def : all_streams) {
       auto stream_info = side_panel::mojom::StreamInfo::New();
       stream_info->stream_id = stream_def.stream_id;
       stream_info->label = stream_def.label;
@@ -200,7 +201,12 @@ void DataSipperPageHandler::GetStreamEvents(const std::string& stream_id,
       event_info->stream_id = event.stream_id;
       event_info->timestamp = event.timestamp.InMillisecondsSinceUnixEpoch();
       event_info->event_type = event.event_type;
-      event_info->data = event.data;
+
+      // Serialize base::Value to JSON string
+      std::string json_str;
+      base::JSONWriter::Write(event.data, &json_str);
+      event_info->data = json_str;
+
       events.push_back(std::move(event_info));
     }
   }
@@ -234,7 +240,8 @@ void DataSipperPageHandler::SetStreamActive(const std::string& stream_id,
   bool success = false;
 
   if (service && service->stream_registry()) {
-    success = service->stream_registry()->SetStreamActive(stream_id, active);
+    service->stream_registry()->SetStreamActive(stream_id, active);
+    success = true;
   }
 
   std::move(callback).Run(success);
